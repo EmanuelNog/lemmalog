@@ -145,6 +145,13 @@ aggregates need):
   watchlist/checklist as `added(X)` per item and `watched(X)`/`done(X)`
   when consumed; current membership is then a rule —
   `pending(X) :- added(X), !watched(X).` — not something you recount.
+- **A set that gets revised needs a revision key, not exclusivity.**
+  `exclusive("rel")` matches the relation name exactly and means ONE open
+  object per (subject, relation), so declaring a three-course plan
+  exclusive keeps only the last course. Put the revision in the relation
+  name instead — `plan_spring_2027_v2`, one fact per course — and read it
+  through a one-rule view: "latest revision" is a property of the view,
+  not of the fact.
 - **Conditional preferences stay conditional.**
   `prefers_when(user, lively, with_friends)` — never assert the
   condition itself as a fact unless the source says it holds now.
@@ -159,6 +166,9 @@ aggregates need):
   `depends_on(X, Y)` instead installs cleanly, reports a backfill count, and
   then derives nothing — the failure is silent, so check a new rule with one
   `lemmalog_query` before building on it.
+- **A fully-ground goal is a yes/no question.** `current("Milo", "advisor",
+  "Ferrin")` answers `true` or `false` (same through `lemmalog-cli query`);
+  keep a variable when you want bindings.
 - Rule syntax: `head(X, Y) :- atom(X, Y), X \= Z.` with `!atom` negation,
   `now(T)`, comparisons, arithmetic; aggregates only in heads.
 - Time is bitemporal, and the clocks are separate. `ts` on

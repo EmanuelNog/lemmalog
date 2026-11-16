@@ -182,6 +182,26 @@ finally:
     c.close()
 
 
+# --- 9. a fully-ground goal answers true/false (fork patch 9, chk-n5va.161) --
+c = Server(SNAP)
+try:
+    t, e = c.tool("lemmalog_query", goal='current("alpha", "owns", "one")')
+    check("MCP: a ground goal that holds answers true", not e and t.strip() == "true", t[:60])
+    t, e = c.tool("lemmalog_query", goal='current("alpha", "owns", "nope")')
+    check("MCP: a ground goal that does not hold answers false", not e and t.strip() == "false", t[:60])
+    t, e = c.tool("lemmalog_query", goal='current("alpha", "owns", Y)')
+    check("MCP: a goal with variables still returns bindings", not e and "Y=" in t, t[:60])
+finally:
+    c.close()
+
+ok, out, rc = cli("query", "--goal", 'current("alpha", "owns", "one")')
+check("CLI: a ground goal that holds prints true", ok and out == "true", f"rc={rc} {out[:40]}")
+ok, out, rc = cli("query", "--goal", 'current("alpha", "owns", "nope")')
+check("CLI: a ground goal that does not hold prints false", ok and out == "false", f"rc={rc} {out[:40]}")
+ok, out, rc = cli("query", "--goal", 'current("alpha", "owns", Y)')
+check("CLI: a goal with variables still prints bindings", ok and "Y=one" in out, f"rc={rc} {out[:60]}")
+
+
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")
 sys.exit(1 if fails else 0)

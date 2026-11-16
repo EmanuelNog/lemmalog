@@ -104,7 +104,7 @@ fn tools() -> J {
         tool("lemmalog_retract",
             "Retract facts that turned out to be WRONG (line protocol, same as observe). Open matching rows are removed and invalidation propagates: the response reports which derived facts died as a consequence. For a value that merely CHANGED, prefer re-asserting the same relation (the update policy supersedes).", &["facts"], &["facts"]),
         tool("lemmalog_query",
-            "Query derived memory: a goal atom like 'reports_to(\"Alice\", Y)' or 'current(X, works_at, O)'. Returns variable bindings. Read-only.", &["goal"], &["goal"]),
+            "Query derived memory: a goal atom like 'reports_to(\"Alice\", Y)' or 'current(X, works_at, O)'. Returns variable bindings; a fully-ground goal returns true or false. Read-only.", &["goal"], &["goal"]),
         tool("lemmalog_query_deep",
             "Demand-driven query (magic sets) for exploratory points: same goal syntax as lemmalog_query.", &["goal"], &["goal"]),
         tool("lemmalog_why",
@@ -509,16 +509,23 @@ fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Res
         "lemmalog_query" => {
             let goal = args["goal"].as_str().unwrap_or_default().to_string();
             sync_clock(state);
-            match engine_of(state).ask(&goal) {
-                Ok(rows) => Ok(if rows.is_empty() {
-                    empty_query_hint(engine_of(state), &goal)
-                } else {
-                    rows.join("\n")
-                }),
-                Err(e) => Err(format!(
-                    "parse: could not parse goal `{}`\nreason: {e}\nhint: quote entity names — bare capitalized words are variables. Example: reports_to(\"Alice\", Y)",
-                    truncate(&goal, 120)
-                )),
+            // FORK CHANGE (chk-n5va.161): a fully-ground goal is a yes/no
+            // question — answer `true`/`false` instead of an empty string,
+            // which an agent cannot tell apart from "no answers".
+            match engine_of(state).holds(&goal) {
+                Ok(Some(t)) => Ok(if t { "true".to_string() } else { "false".to_string() }),
+                // variables: bindings, as before (parse errors surface here too)
+                _ => match engine_of(state).ask(&goal) {
+                    Ok(rows) => Ok(if rows.is_empty() {
+                        empty_query_hint(engine_of(state), &goal)
+                    } else {
+                        rows.join("\n")
+                    }),
+                    Err(e) => Err(format!(
+                        "parse: could not parse goal `{}`\nreason: {e}\nhint: quote entity names — bare capitalized words are variables. Example: reports_to(\"Alice\", Y)",
+                        truncate(&goal, 120)
+                    )),
+                },
             }
         }
         "lemmalog_query_deep" => {

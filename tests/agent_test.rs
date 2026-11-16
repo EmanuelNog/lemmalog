@@ -662,3 +662,54 @@ fn bitemporal_stamp_and_belief_query() {
         .unwrap();
     assert!(early.is_empty());
 }
+
+#[test]
+fn exclusive_matches_the_relation_name_exactly() {
+    // chk-n5va.162 suspected `exclusive()` matched relation names by prefix, so
+    // declaring plan_spring_2027 exclusive collapsed a 3-course plan. The lookup
+    // is an exact key on the `exclusive` relation; the prefix matching in that
+    // bead was the CALLER's (the MemDerive harness declared every plan_<term>
+    // relation exclusive). See FORK-NOTES.md, "Encoding a multi-valued fact
+    // that also needs revision".
+    let mut m = mem("exclusive(\"plan_spring_2027\").");
+    m.maintain(1); // materialize the rule's base fact before any update decision
+    m.observe(
+        "milo --plan_spring_2027--> crt_330\n\
+         milo --plan_spring_2027--> gls_220\n\
+         milo --plan_spring_2027_v2--> tde_380\n\
+         milo --plan_spring_2027_v2--> hum_120",
+    );
+    m.maintain(100);
+    // declared exclusive: one open object, the later assertion replaces
+    assert_eq!(
+        m.ask("current(\"milo\", \"plan_spring_2027\", O)")
+            .unwrap()
+            .len(),
+        1
+    );
+    // a look-alike name that merely shares the prefix is untouched
+    assert_eq!(
+        m.ask("current(\"milo\", \"plan_spring_2027_v2\", O)")
+            .unwrap()
+            .len(),
+        2,
+        "exclusivity must not leak to a relation that shares the prefix"
+    );
+}
+
+#[test]
+fn declaring_the_prefix_alone_does_not_make_a_relation_exclusive() {
+    // the other direction of the same guarantee: `exclusive("plan")` is a
+    // declaration about a relation literally named `plan`
+    let mut m = mem("exclusive(\"plan\").");
+    m.maintain(1);
+    m.observe("milo --plan_spring_2027--> crt_330\nmilo --plan_spring_2027--> gls_220");
+    m.maintain(100);
+    assert_eq!(
+        m.ask("current(\"milo\", \"plan_spring_2027\", O)")
+            .unwrap()
+            .len(),
+        2,
+        "a set-valued relation stays set-valued"
+    );
+}

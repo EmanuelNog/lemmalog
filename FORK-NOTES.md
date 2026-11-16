@@ -74,6 +74,79 @@ failure is no longer invisible.
 
 ---
 
+## 5. Aggregates fold source rows, not projected `(group, value)` tuples
+
+**Upstream:** `lower_agg_clause` lowers an aggregate head to a temp relation
+`(group args..., inner terms...)` and the fold reads the temp relation. A
+relation is a SET, so two body rows sharing the group and the value collapse:
+five courses worth 4,4,3,3,2 answered `sum`=7, and `count` answered the number
+of distinct values rather than the number of rows (24 credits totalling 76
+answered `count`=2, `sum`=7).
+
+**Ours:** the source row's columns — the args of the leftmost body atom binding
+the aggregated variable — are appended to the temp key, so the fold sees one
+row per source row. A value repeated by two rows counts twice (two 11-credit
+courses are 22); the same row reached through a one-to-many join counts once
+(one 3-credit course in two sections is 3). `count` is therefore COUNT(*) over
+the source relation restricted by the rest of the body, not COUNT(DISTINCT
+value). To fold over join solutions, aggregate over a relation keyed that way.
+
+**Files:** `src/eval.rs` — `lower_agg_clause`, `collect_vars`, `atom_binds`.
+
+**Test:** `cargo test --release --features mcp --test agg_test`.
+
+## 6. A fully-ground goal answers `true` / `false`
+
+**Upstream:** `Engine::ask` returns bindings; for a goal with no variables it
+returns a single row rendered as `""`, which the CLI prints as a blank line and
+the MCP tool as an empty string — identical to "no answers", so a yes/no
+question could not be asked.
+
+**Ours:** `Engine::holds` answers `Some(true|false)` for a ground atom and
+`None` when the goal still binds something; `lemmalog-cli query` and the
+`lemmalog_query` MCP tool print the verdict. No new exit code — this CLI has
+none for "no answers" (an empty variable result is exit 0), so `false` is exit
+0 too and the text is the verdict.
+
+**Files:** `src/eval.rs` (`holds`), `src/agent.rs` (pass-through),
+`src/bin/lemmalog-cli.rs` (query arm), `src/bin/lemmalog-mcp.rs` (query arm +
+tool description).
+
+**Test:** `cargo test --release --features mcp --test ground_query`,
+`tests/interop_store.py`.
+
+---
+
+## Encoding a multi-valued fact that also needs revision
+
+`exclusive("rel")` matches the relation name **exactly** — `apply_update` looks
+the interned predicate up in the `exclusive` relation, not by prefix
+(pinned by `tests/agent_test.rs::exclusive_matches_the_relation_name_exactly`).
+The only prefix matching in the update policy is `MULTI`/`FUNCTIONAL` in
+`src/agent.rs` (`evidence*`, `status*`, ...); `plan_*` is in neither list.
+
+So a set-valued relation must not be declared exclusive: `exclusive("plan_spring_2027")`
+on a plan holding three courses keeps only the last, because exclusivity means
+one open object per (subject, relation). (chk-n5va.162 was filed as an engine
+prefix-matching bug; the collapse came from the caller — the MemDerive harness
+declared every `plan_` relation exclusive by prefix — so the bead is invalid.)
+
+Put the revision in the relation name and let a view pick the latest one:
+
+```prolog
+% each revision is its own multi-valued relation; re-planning adds a v2
+% (facts): milo --plan_spring_2027_v1--> crt_330 ; milo --plan_spring_2027_v2--> gls_220
+plan_courses(S, C) :- current(S, "plan_spring_2027_v2", C).
+% when a v3 arrives, retract the v2 view rule and add:
+% plan_courses(S, C) :- current(S, "plan_spring_2027_v3", C).
+```
+
+Revisions are additive, and "latest" is a property of the view (one rule per
+revision), not of the fact. Do not use exclusivity to mean "this set was
+replaced" — a set needs the group key in its name.
+
+---
+
 ## Known weaknesses we have NOT patched
 
 - **No cross-process merge.** Two writers still converge to *last whole file*; we

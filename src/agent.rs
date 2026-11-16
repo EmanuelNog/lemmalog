@@ -578,6 +578,13 @@ impl<X: Extractor> AgentMemory<X> {
         self.engine.ask(goal)
     }
 
+    /// Truth value of a fully-ground goal (`None` when the goal has variables):
+    /// see `Engine::holds` — the yes/no surface the CLI and MCP print instead
+    /// of an empty row.
+    pub fn holds(&self, goal: &str) -> Result<Option<bool>, crate::ast::ParseError> {
+        self.engine.holds(goal)
+    }
+
     /// Ingest PRE-PARSED facts (callers that extract themselves, e.g. the
     /// MCP server where the host model does extraction): applies the same
     /// update policy as `observe_at`, and returns the drop report for any

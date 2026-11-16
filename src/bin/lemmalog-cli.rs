@@ -6,6 +6,7 @@
 //!
 //!   lemmalog-cli observe  --facts 'alice --works_at--> acme'
 //!   lemmalog-cli query   --goal 'current("alice", R, O)'
+//!                        (a fully-ground goal prints true/false)
 //!   lemmalog-cli retract --facts 'alice --works_at--> acme'
 //!   lemmalog-cli context --query 'where does alice work'
 //!   lemmalog-cli why     --fact 'reports_to(alice, carol)'
@@ -165,16 +166,33 @@ fn main() {
             let (mut m, _stamp) = load(&snap_path());
             sync_clock(&mut m);
             let goal = stdin_or_flag(&args, "--goal");
-            match m.ask(&goal) {
-                Ok(rows) => {
-                    if rows.is_empty() {
-                        println!("(no answers — asserted facts are current(S, rel, O))");
-                    } else {
-                        println!("{}", rows.join("\n"));
+            // FORK CHANGE (chk-n5va.161): a fully-ground goal is a yes/no
+            // question. `ask` answers it with a single row that has no
+            // bindings — printed as a blank line, exactly like "no answers" —
+            // so answer with the verdict instead. No separate exit code:
+            // nothing in this CLI distinguishes "no answers" (an empty
+            // variable result is exit 0), so `false` is exit 0 too and the
+            // text carries the answer.
+            match m.holds(&goal) {
+                Ok(Some(true)) => println!("true"),
+                Ok(Some(false)) => println!("false"),
+                Ok(None) => match m.ask(&goal) {
+                    Ok(rows) => {
+                        if rows.is_empty() {
+                            println!("(no answers — asserted facts are current(S, rel, O))");
+                        } else {
+                            println!("{}", rows.join("\n"));
+                        }
                     }
-                }
+                    Err(e) => {
+                        eprintln!("parse: {e}\nhint: quote entity names — bare capitalized words are variables");
+                        std::process::exit(1);
+                    }
+                },
                 Err(e) => {
-                    eprintln!("parse: {e}\nhint: quote entity names — bare capitalized words are variables");
+                    eprintln!(
+                        "parse: {e}\nhint: quote entity names — bare capitalized words are variables"
+                    );
                     std::process::exit(1);
                 }
             }

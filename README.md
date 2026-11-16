@@ -509,8 +509,14 @@ big_spender(Person) :- kit_count(Person, N), N >= 3.
 
 Semantics and guarantees:
 - Group key = the non-aggregated head prefix; each `count/min/max/sum`
-  folds a column over the group's distinct body solutions
-  (`count` is COUNT-DISTINCT by set semantics).
+  folds one column over the group's **source rows** — the rows of the
+  relation the aggregated value comes from (the leftmost body atom binding
+  it). Rows are distinct, so a value repeated by two rows counts twice
+  (two 11-credit courses are 22) and one row reached through a one-to-many
+  join counts once (one 3-credit course in two sections is 3). `count`
+  therefore counts rows, not distinct values: `COUNT(*)` over the source
+  relation restricted by the rest of the body. To fold over join solutions
+  instead, aggregate over a relation keyed the way you want them counted.
 - **Strict stratum ordering**: aggregated predicates complete their
   fold before any reader evaluates — enforced by treating aggregation
   dependencies like negation edges in the stratification, with

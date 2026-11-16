@@ -1239,11 +1239,31 @@ impl<A: Annotation> Engine<A> {
         format!("__agg:{}:{ci}", self.clauses[ci].head.pred)
     }
 
-    /// Lower an aggregation clause: head = temp(group args..., inner
-    /// terms...); body unchanged. The ordinary evaluator enumerates all
-    /// body solutions into the temp relation (set semantics = distinct
-    /// (group, value) pairs, which is exactly COUNT(DISTINCT) and is
-    /// idempotent for min/max/sum).
+    /// Lower an aggregation clause: head = temp(group args..., inner terms...,
+    /// source-row args...); body unchanged.
+    ///
+    /// ## What the fold counts (chk-n5va.160)
+    ///
+    /// A relation holds a SET of rows, so the temp relation must carry enough
+    /// columns to keep the rows the fold is meant to see apart. The fold's unit
+    /// is one *source row*: the arguments of the leftmost positive body atom
+    /// that binds the aggregate's inner term — the relation the value comes
+    /// from. Those args are appended to the temp head, so
+    ///
+    /// - two rows carrying the same value stay two rows (`sum(N)` over two
+    ///   11-credit courses is 22, not 11);
+    /// - the same row reached through two join paths stays one row (`sum(N)`
+    ///   over one 3-credit course offered in two sections is 3, not 6);
+    /// - `count` counts those rows, i.e. `COUNT(*)` over the source relation
+    ///   restricted by the rest of the body, not `COUNT(DISTINCT value)`.
+    ///
+    /// Keying on the projected `(group, value)` tuple instead — what this did
+    /// before — silently merges equal values: 24 credit facts totalling 76
+    /// answered `sum`=7 and `count`=2 (the MemDerive failure). To fold over
+    /// *join* solutions rather than source rows, aggregate over a relation keyed
+    /// the way you want them counted (e.g. `fee(P, Section, F)` -> `sum(F)`).
+    /// A `_` in the body is not a column: name the variable when its
+    /// multiplicity matters. See README "Aggregation" and tests/agg_test.rs.
     fn lower_agg_clause(&self, ci: usize) -> Clause {
         let c = &self.clauses[ci];
         let mut args = Vec::new();
@@ -1253,6 +1273,60 @@ impl<A: Annotation> Engine<A> {
                 other => args.push(other.clone()),
             }
         }
+        // variables the fold reads: the aggregate inner terms
+        let mut folded: Vec<&str> = Vec::new();
+        for t in &c.head.args {
+            if let Term::Agg(_, inner) = t {
+                collect_vars(inner, &mut folded);
+            }
+        }
+        // row identity: the args of the leftmost positive atom binding each
+        // folded variable (one atom can supply several)
+        let mut identity: Vec<Term> = Vec::new();
+        let mut used: Vec<usize> = Vec::new();
+        for v in &folded {
+            let src = c.body.iter().position(|lit| match lit {
+                Lit::Pos(a) => atom_binds(a, v),
+                _ => false,
+            });
+            if let Some(i) = src {
+                if !used.contains(&i) {
+                    used.push(i);
+                    if let Lit::Pos(a) = &c.body[i] {
+                        identity.extend(
+                            a.args
+                                .iter()
+                                .filter(|t| !matches!(t, Term::Wildcard))
+                                .cloned(),
+                        );
+                    }
+                }
+            }
+        }
+        if identity.is_empty() {
+            // no source atom (a constant aggregate like count(1)): keep one
+            // temp column per body variable, so the fold still counts
+            // solutions instead of collapsing them into one row
+            let mut known: Vec<&str> = Vec::new();
+            for t in &args {
+                collect_vars(t, &mut known);
+            }
+            for lit in &c.body {
+                if let Lit::Pos(a) = lit {
+                    for t in &a.args {
+                        let mut names: Vec<&str> = Vec::new();
+                        collect_vars(t, &mut names);
+                        for n in names {
+                            if !known.contains(&n) {
+                                known.push(n);
+                                identity.push(Term::Var(n.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        args.extend(identity);
         Clause {
             name: c.name.clone(),
             head: crate::ast::Atom {
@@ -2030,12 +2104,45 @@ impl<A: Annotation> Engine<A> {
         Ok(rows)
     }
 
+    /// Truth value of a fully-ground goal: `Some(true)` when the atom holds,
+    /// `Some(false)` when it does not, `None` when the goal still binds
+    /// something (the caller asked for bindings, not a verdict).
+    ///
+    /// `ask` cannot answer a yes/no question: a ground goal that holds returns
+    /// exactly one row with no bindings, which renders as the empty string —
+    /// indistinguishable from "no answers" (chk-n5va.161). A ground atom over a
+    /// predicate the store never received is `false`, matching closed-world
+    /// reading of the store.
+    pub fn holds(&self, goal: &str) -> Result<Option<bool>, crate::ast::ParseError> {
+        let prog = crate::ast::parse_program(&format!("{goal}."))?;
+        if prog.len() != 1 || !prog[0].is_fact {
+            return Err(crate::ast::ParseError(format!(
+                "holds: expected a single atom, got {goal:?}"
+            )));
+        }
+        let head = &prog[0].head;
+        if !head
+            .args
+            .iter()
+            .all(|t| matches!(t, Term::Sym(_) | Term::Int(_)))
+        {
+            return Ok(None);
+        }
+        let bound = self.resolve_bound(&head.args, &Env::new());
+        let holds = self
+            .relations
+            .get(&head.pred)
+            .map(|rel| !rel.lookup(&bound).is_empty())
+            .unwrap_or(false);
+        Ok(Some(holds))
+    }
+
     /// Ask a conjunctive-free ground-or-varied atom, e.g.
     /// `current("alice", R, O)` or `reports_to(X, "carol")`, and get the
     /// variable bindings. Read-only, side-effect-free, terminating: the
     /// agent-facing query surface. Returns rendered rows like
     /// `R=works_at, O=acme`; a ground goal yields one empty-string row if
-    /// the fact holds.
+    /// the fact holds — callers that want a verdict call `holds` instead.
     pub fn ask(&self, goal: &str) -> Result<Vec<String>, crate::ast::ParseError> {
         let prog = crate::ast::parse_program(&format!("{goal}."))?;
         if prog.len() != 1 || !prog[0].is_fact {
@@ -2220,4 +2327,24 @@ fn cmp_holds(op: CmpOp, a: Value, b: Value) -> bool {
         CmpOp::Eq => a == b,
         CmpOp::Ne => a != b,
     }
+}
+
+/// Every variable name inside a term, in order. An aggregate inner term counts:
+/// a variable bound only through `count(X)` is still part of the fold's row.
+fn collect_vars<'a>(t: &'a Term, out: &mut Vec<&'a str>) {
+    match t {
+        Term::Var(v) => out.push(v),
+        Term::Agg(_, inner) => collect_vars(inner, out),
+        Term::Sym(_) | Term::Int(_) | Term::Wildcard => {}
+    }
+}
+
+/// Does this body atom bind `var`? Used by `lower_agg_clause` to find the
+/// relation a folded value comes from.
+fn atom_binds(a: &crate::ast::Atom, var: &str) -> bool {
+    a.args.iter().any(|t| {
+        let mut names = Vec::new();
+        collect_vars(t, &mut names);
+        names.contains(&var)
+    })
 }
