@@ -1196,7 +1196,7 @@ impl<X: Extractor> AgentMemory<X> {
                 );
             }
         }
-        std::fs::write(path, out)
+        crate::store::write_atomic(path, &out)
     }
 
     /// Load a snapshot into a fresh memory with the given extractor.

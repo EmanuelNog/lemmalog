@@ -32,14 +32,52 @@ fn snap_path() -> String {
     })
 }
 
-fn load(path: &str) -> AgentMemory<MockExtractor> {
+/// Load the snapshot, returning the memory and the version stamp it was read at.
+///
+/// FORK CHANGE: a load failure on an EXISTING file is fatal (exit 3) instead of
+/// silently starting fresh — upstream's fallback let the next save overwrite a
+/// corrupt-but-recoverable snapshot with an empty one. A missing file is a
+/// legitimate first use and still starts fresh.
+fn load(path: &str) -> (AgentMemory<MockExtractor>, Option<lemmalog::store::Stamp>) {
+    if !std::path::Path::new(path).exists() {
+        return (AgentMemory::new(MockExtractor::new(0.9), "").expect("fresh memory"), None);
+    }
     match AgentMemory::load(MockExtractor::new(0.9), path) {
-        Ok(m) => m,
+        Ok(m) => {
+            let st = lemmalog::store::Stamp::of(path);
+            (m, st)
+        }
         Err(e) => {
-            eprintln!("lemmalog-cli: snapshot load failed ({e}); starting fresh");
-            AgentMemory::new(MockExtractor::new(0.9), "").expect("fresh memory")
+            eprintln!(
+                "lemmalog-cli: snapshot load failed ({e}); refusing to start fresh — \
+                 that would overwrite {path}. Move the file aside to reset."
+            );
+            std::process::exit(3);
         }
     }
+}
+
+/// Save, but refuse when another process rewrote the file after we loaded it.
+///
+/// FORK CHANGE: upstream saves unconditionally (`fs::write`), so a concurrent
+/// writer's work is silently replaced. We cannot merge two whole-file states, so
+/// the honest behaviour is to fail loudly and let the caller re-run the command
+/// against the current file.
+fn save_checked(
+    m: &AgentMemory<MockExtractor>,
+    path: &str,
+    at_load: Option<lemmalog::store::Stamp>,
+) {
+    if let Some(st) = at_load {
+        if lemmalog::store::Stamp::of(path) != Some(st) {
+            eprintln!(
+                "lemmalog-cli: {path} changed while this command was running — refusing to \
+                 overwrite another writer's state. Re-run the command."
+            );
+            std::process::exit(3);
+        }
+    }
+    m.save(path).expect("save snapshot");
 }
 
 fn flag(args: &[String], name: &str) -> Option<String> {
@@ -62,13 +100,13 @@ fn main() {
     let cmd = args.first().cloned().unwrap_or_default();
     match cmd.as_str() {
         "observe" => {
-            let mut m = load(&snap_path());
+            let (mut m, stamp) = load(&snap_path());
             let text = stdin_or_flag(&args, "--facts");
             let ts = flag(&args, "--ts").and_then(|t| t.parse::<i64>().ok());
             let ts = ts.unwrap_or(m.engine.now);
             let (report, dropped) = m.observe_extracted(&text, ts);
             let _ = m.maintain(m.engine.now);
-            m.save(&snap_path()).expect("save snapshot");
+            save_checked(&m, &snap_path(), stamp);
             println!(
                 "added={} updated={} noop={} escalations={}",
                 report.added,
@@ -81,10 +119,10 @@ fn main() {
             }
         }
         "retract" => {
-            let mut m = load(&snap_path());
+            let (mut m, stamp) = load(&snap_path());
             let text = stdin_or_flag(&args, "--facts");
             let (done, missing, died) = m.retract_facts(&text);
-            m.save(&snap_path()).expect("save snapshot");
+            save_checked(&m, &snap_path(), stamp);
             println!("retracted {} fact(s)", done.len());
             if !died.is_empty() {
                 println!("{} derived fact(s) died:", died.len());
@@ -97,7 +135,7 @@ fn main() {
             }
         }
         "query" => {
-            let m = load(&snap_path());
+            let (m, _stamp) = load(&snap_path());
             let goal = stdin_or_flag(&args, "--goal");
             match m.ask(&goal) {
                 Ok(rows) => {
@@ -114,7 +152,7 @@ fn main() {
             }
         }
         "context" => {
-            let m = load(&snap_path());
+            let (m, _stamp) = load(&snap_path());
             let query = stdin_or_flag(&args, "--query");
             let budget = flag(&args, "--budget")
                 .and_then(|b| b.parse::<usize>().ok())
@@ -122,17 +160,17 @@ fn main() {
             print!("{}", m.context_for_query_rich(&query, budget));
         }
         "why" => {
-            let m = load(&snap_path());
+            let (m, _stamp) = load(&snap_path());
             let fact = stdin_or_flag(&args, "--fact");
             println!("{}", m.why(&fact));
         }
         "rules" => {
-            let mut m = load(&snap_path());
+            let (mut m, stamp) = load(&snap_path());
             let rules = stdin_or_flag(&args, "--rules");
             match m.install_rules(&rules) {
                 Ok(id) => {
                     let n = m.maintain(m.engine.now);
-                    m.save(&snap_path()).expect("save snapshot");
+                    save_checked(&m, &snap_path(), stamp);
                     println!("installed {id}; backfill derived +{n} facts");
                     for w in m.batch_conflicts(&id) {
                         println!("WARNING: {w}");
@@ -145,11 +183,11 @@ fn main() {
             }
         }
         "rmrules" => {
-            let mut m = load(&snap_path());
+            let (mut m, stamp) = load(&snap_path());
             let id = flag(&args, "--id").expect("--id <batch>");
             if m.uninstall_rules(&id) {
                 let _ = m.maintain(m.engine.now);
-                m.save(&snap_path()).expect("save snapshot");
+                save_checked(&m, &snap_path(), stamp);
                 println!("uninstalled {id}; derivations reverted");
             } else {
                 eprintln!("no batch {id:?} (see: lemmalog-cli batches)");
@@ -157,13 +195,13 @@ fn main() {
             }
         }
         "batches" => {
-            let m = load(&snap_path());
+            let (m, _stamp) = load(&snap_path());
             for (id, src) in m.rule_batches() {
                 println!("{id}: {}", src.lines().next().unwrap_or(""));
             }
         }
         "dump" => {
-            let m = load(&snap_path());
+            let (m, _stamp) = load(&snap_path());
             let pred = flag(&args, "--pred");
             let mut preds: Vec<&String> = m.engine.relations.keys().collect();
             preds.sort();

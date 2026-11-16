@@ -31,6 +31,11 @@ use std::io::{BufRead, Write};
 
 struct State {
     memory: AgentMemory<lemmalog::agent::MockExtractor>,
+    /// FORK ADDITION: the snapshot this server persists to, and the version it
+    /// was read/written at. A long-lived server otherwise keeps serving (and
+    /// then overwriting) the copy it loaded at startup.
+    path: Option<String>,
+    stamp: Option<lemmalog::store::Stamp>,
 }
 
 fn main() {
@@ -45,7 +50,11 @@ fn main() {
             }
         }
     }
-    let mut state = State { memory };
+    let mut state = State {
+        memory,
+        stamp: path.as_deref().and_then(lemmalog::store::Stamp::of),
+        path: path.clone(),
+    };
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -283,7 +292,31 @@ Asserted facts live under current(S, rel, O)",
     }
 }
 
+/// FORK ADDITION: pick up a write made by another process (CLI, cron, a second
+/// session's server) instead of serving — and later clobbering — the snapshot
+/// loaded at startup. Every mutation is saved before its call returns, so no
+/// in-memory state is lost by reloading; derived facts are rebuilt by `load`.
+fn reload_if_changed(state: &mut State) {
+    let Some(p) = state.path.clone() else { return };
+    let now = lemmalog::store::Stamp::of(&p);
+    if now == state.stamp {
+        return;
+    }
+    if !std::path::Path::new(&p).exists() {
+        return;
+    }
+    match AgentMemory::load(lemmalog::agent::MockExtractor::new(0.9), &p) {
+        Ok(m) => {
+            state.memory = m;
+            state.stamp = now;
+            eprintln!("lemmalog-mcp: reloaded {p} (another process wrote it)");
+        }
+        Err(e) => eprintln!("lemmalog-mcp: reload skipped, load failed: {e}"),
+    }
+}
+
 fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Result<J, String> {
+    reload_if_changed(state);
     // Input errors (bad goal syntax, rejected rules, unknown batch id)
     // return as tool results with isError: true so the model can
     // self-correct; JSON-RPC errors are reserved for unknown tools and
@@ -610,7 +643,10 @@ fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Res
                 "input: LEMMALOG_MCP_PATH not set — register the server with --env LEMMALOG_MCP_PATH=...".to_string()
             })?;
             match state.memory.save(p) {
-                Ok(_) => Ok(format!("saved to {p}")),
+                Ok(_) => {
+                    state.stamp = lemmalog::store::Stamp::of(p);
+                    Ok(format!("saved to {p}"))
+                }
                 Err(e) => Err(format!("io: snapshot save failed: {e}")),
             }
         }
@@ -679,7 +715,12 @@ fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Res
         )
     {
         if let Some(p) = path {
-            let _ = state.memory.save(p);
+            // FORK ADDITION: a failed persist used to be swallowed, so the model
+            // was told "ok" for a fact that vanished with the process.
+            match state.memory.save(p) {
+                Ok(_) => state.stamp = lemmalog::store::Stamp::of(p),
+                Err(e) => eprintln!("lemmalog-mcp: persist failed: {e}"),
+            }
         }
     }
     Ok(json!({
