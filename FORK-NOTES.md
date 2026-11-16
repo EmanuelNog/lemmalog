@@ -76,16 +76,14 @@ failure is no longer invisible.
 
 ## Known weaknesses we have NOT patched
 
-- **Unknown tool arguments are silently ignored.** `args["goal"]` etc. are read
-  individually, so a caller passing `query=` instead of `goal=` gets an empty goal
-  and a parse error far from the cause. Requires schema-aware validation.
 - **No cross-process merge.** Two writers still converge to *last whole file*; we
-  removed the silent clobber and the torn read, not the lost update. A real fix
-  needs a lock file taken across read-modify-write in both binaries (upstream has
-  no `libc`/`fs2` dependency, so it is a Cargo change and a bigger merge surface).
-- **`batches` (CLI) prints only the first line** of a multi-line rule batch; the
-  MCP tool prints the full source. Rules cannot be exported from the CLI alone.
-
+  removed the silent clobber, the torn read and the failed-write-answered-as-success,
+  not the lost update. A real fix needs a lock taken across read-modify-write in both
+  binaries (a `libc`/`fs2` dependency = a Cargo change and a wider merge surface).
+- **Extraction quality, not the store, is the ceiling.** The host model writes the
+  facts; the engine only derives. Measured on MemDerive: goals whose vocabulary the
+  store never received score 0 no matter how correct the store's mechanics are. Bash
+  `observe` with a tight relation vocabulary beats a clever rule set over coarse facts.
 ## Running the fork's checks
 
 ```bash

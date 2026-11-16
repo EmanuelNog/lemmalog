@@ -95,12 +95,38 @@ fn stdin_or_flag(args: &[String], name: &str) -> String {
     buf
 }
 
+
+/// Wall clock in seconds, matching the MCP server's default for `observe`.
+fn wall_clock() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// FORK ADDITION: answer reads at "now", exactly as the server does.
+///
+/// The MCP server calls its `sync_clock` before every read; the CLI did not, so the
+/// same snapshot could answer `current/3` differently depending on which surface
+/// asked (a fact whose validity ended, or has not begun, is invisible to one and
+/// visible to the other). Advancing the clock only invalidates and recomputes
+/// derived relations — no fact is added, retracted or persisted by this.
+fn sync_clock(m: &mut AgentMemory<MockExtractor>) {
+    let t = wall_clock();
+    if t > m.engine.now {
+        m.engine.set_now(t);
+        m.engine.invalidate_derived();
+        let _ = m.engine.run();
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().cloned().unwrap_or_default();
     match cmd.as_str() {
         "observe" => {
             let (mut m, stamp) = load(&snap_path());
+            sync_clock(&mut m);
             let text = stdin_or_flag(&args, "--facts");
             let ts = flag(&args, "--ts").and_then(|t| t.parse::<i64>().ok());
             let ts = ts.unwrap_or(m.engine.now);
@@ -120,6 +146,7 @@ fn main() {
         }
         "retract" => {
             let (mut m, stamp) = load(&snap_path());
+            sync_clock(&mut m);
             let text = stdin_or_flag(&args, "--facts");
             let (done, missing, died) = m.retract_facts(&text);
             save_checked(&m, &snap_path(), stamp);
@@ -135,7 +162,8 @@ fn main() {
             }
         }
         "query" => {
-            let (m, _stamp) = load(&snap_path());
+            let (mut m, _stamp) = load(&snap_path());
+            sync_clock(&mut m);
             let goal = stdin_or_flag(&args, "--goal");
             match m.ask(&goal) {
                 Ok(rows) => {
@@ -152,7 +180,8 @@ fn main() {
             }
         }
         "context" => {
-            let (m, _stamp) = load(&snap_path());
+            let (mut m, _stamp) = load(&snap_path());
+            sync_clock(&mut m);
             let query = stdin_or_flag(&args, "--query");
             let budget = flag(&args, "--budget")
                 .and_then(|b| b.parse::<usize>().ok())
@@ -160,12 +189,14 @@ fn main() {
             print!("{}", m.context_for_query_rich(&query, budget));
         }
         "why" => {
-            let (m, _stamp) = load(&snap_path());
+            let (mut m, _stamp) = load(&snap_path());
+            sync_clock(&mut m);
             let fact = stdin_or_flag(&args, "--fact");
             println!("{}", m.why(&fact));
         }
         "rules" => {
             let (mut m, stamp) = load(&snap_path());
+            sync_clock(&mut m);
             let rules = stdin_or_flag(&args, "--rules");
             match m.install_rules(&rules) {
                 Ok(id) => {
@@ -184,6 +215,7 @@ fn main() {
         }
         "rmrules" => {
             let (mut m, stamp) = load(&snap_path());
+            sync_clock(&mut m);
             let id = flag(&args, "--id").expect("--id <batch>");
             if m.uninstall_rules(&id) {
                 let _ = m.maintain(m.engine.now);
@@ -195,13 +227,21 @@ fn main() {
             }
         }
         "batches" => {
-            let (m, _stamp) = load(&snap_path());
+            let (mut m, _stamp) = load(&snap_path());
+            sync_clock(&mut m);
             for (id, src) in m.rule_batches() {
-                println!("{id}: {}", src.lines().next().unwrap_or(""));
+                // FORK CHANGE: print the WHOLE batch. Upstream printed only
+                // `src.lines().next()`, so a multi-line batch could not be
+                // round-tripped out of the store.
+                println!("{id}:");
+                for line in src.lines() {
+                    println!("  {line}");
+                }
             }
         }
         "dump" => {
-            let (m, _stamp) = load(&snap_path());
+            let (mut m, _stamp) = load(&snap_path());
+            sync_clock(&mut m);
             let pred = flag(&args, "--pred");
             let mut preds: Vec<&String> = m.engine.relations.keys().collect();
             preds.sort();

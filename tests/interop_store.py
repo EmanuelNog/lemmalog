@@ -92,7 +92,6 @@ try:
 
     t, e = a.tool("lemmalog_query", goal="current(X, \"owns\", Y)")
     check("A sees B's fact without any reload command", "beta" in t and "two" in t, t.replace("\n", " ")[:120])
-    check("unknown argument keys are rejected loudly", True, "see FORK-NOTES: they are silently ignored (documented weakness)")
 
     t, e = a.tool("lemmalog_observe", facts="gamma --owns--> three")
     check("A writes a third fact", not e, t[:60])
@@ -123,6 +122,65 @@ r = subprocess.run([CLI, "observe", "--facts", "eps --owns--> five",
                    env=dict(os.environ, LEMMALOG_MCP_PATH=fresh))
 check("missing snapshot -> created, exit 0", r.returncode == 0 and os.path.exists(fresh),
       f"rc={r.returncode}")
+
+# --- 4. argument validation at the MCP boundary (fork patch 5) -------------
+c = Server(SNAP)
+try:
+    t, e = c.tool("lemmalog_query", query='current(X, "owns", Y)')
+    check("typo'd argument (query= instead of goal=) is rejected", e and "goal" in t, t[:110])
+
+    t, e = c.tool("lemmalog_query")
+    check("missing required argument is named", e and "missing required" in t and "goal" in t, t[:110])
+finally:
+    c.close()
+
+# --- 5. what_if must not touch the store (verified, not assumed) -----------
+ok, before, _ = cli("dump")
+c = Server(SNAP)
+try:
+    t, e = c.tool("lemmalog_what_if", facts="hypo --owns--> pretend", goal='current("hypo", "owns", X)')
+    check("what_if answers the hypothetical", not e, t[:80])
+finally:
+    c.close()
+ok, after, _ = cli("dump")
+check("what_if left the store untouched", before == after)
+
+# --- 6. CLI reads at 'now', like the server (fork patch 6) ----------------
+oldsnap = os.path.join(WORK, "old-clock.snap")
+subprocess.run([CLI, "observe", "--facts", "clocky --owns--> tick", "--ts", "1000000000"],
+               capture_output=True, text=True, env=dict(os.environ, LEMMALOG_MCP_PATH=oldsnap))
+r = subprocess.run([CLI, "rules", "--rules", 'seen_at(X, T) :- current(X, "owns", Y), now(T).'],
+                   capture_output=True, text=True, env=dict(os.environ, LEMMALOG_MCP_PATH=oldsnap))
+r2 = subprocess.run([CLI, "dump", "--pred", "seen_at"], capture_output=True, text=True,
+                    env=dict(os.environ, LEMMALOG_MCP_PATH=oldsnap))
+stamp_year = "1970" if "1000" in r2.stdout else "now"
+check("CLI syncs the clock before reads (now/t builtin is 2026, not the snapshot's 2001)",
+      "1794" in r2.stdout or "1795" in r2.stdout, r2.stdout.strip()[:90] or (r.stderr + r.stdout)[:90])
+
+# --- 7. CLI prints full rule batches (fork patch 7) -----------------------
+r = subprocess.run([CLI, "observe", "--facts", "batchy --owns--> one", "--ts", "1794797100"],
+                   capture_output=True, text=True, env=dict(os.environ, LEMMALOG_MCP_PATH=SNAP))
+r = subprocess.run([CLI, "rules", "--rules",
+                    'pair(X, Y) :- current(X, "owns", Y).\n\npair2(X, Y) :- pair(X, Y).'],
+                   capture_output=True, text=True, env=dict(os.environ, LEMMALOG_MCP_PATH=SNAP))
+r2 = subprocess.run([CLI, "batches"], capture_output=True, text=True,
+                    env=dict(os.environ, LEMMALOG_MCP_PATH=SNAP))
+check("CLI batches print every line of a multi-line batch", "pair2(X, Y)" in r2.stdout,
+      r2.stdout.strip()[-90:])
+
+# --- 8. a failed persist is an error, not a success (fork patch 8) --------
+rodir = os.path.join(WORK, "ro")
+os.makedirs(rodir, exist_ok=True)
+rosnap = os.path.join(rodir, "ro.snap")
+c = Server(rosnap)
+os.chmod(rodir, 0o500)
+try:
+    t, e = c.tool("lemmalog_observe", facts="cannot --be--> written")
+    check("failed persist reports isError + the reason", e and "persist FAILED" in t, t[:120])
+finally:
+    os.chmod(rodir, 0o700)
+    c.close()
+
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "ALL PASS")

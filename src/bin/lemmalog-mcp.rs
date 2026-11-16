@@ -315,8 +315,73 @@ fn reload_if_changed(state: &mut State) {
     }
 }
 
+
+/// FORK ADDITION: catch argument mistakes at the boundary.
+///
+/// The tool schemas are static, yet upstream read `args["goal"]` key by key — so a
+/// caller passing `query=` instead of `goal=` got an EMPTY goal and a Datalog parse
+/// error that said nothing about the real mistake (hit live during testing).
+fn check_args(name: &str, args: &J) -> Result<(), String> {
+    let all = tools();
+    let Some(spec) = all
+        .as_array()
+        .and_then(|a| a.iter().find(|t| t["name"].as_str() == Some(name)))
+    else {
+        return Ok(()); // unknown tool: the dispatcher's "did you mean" is better
+    };
+    let Some(props) = spec["inputSchema"]["properties"].as_object() else {
+        return Ok(());
+    };
+    let Some(given) = args.as_object() else {
+        return Err("input: arguments must be a JSON object".to_string());
+    };
+    let unknown: Vec<&str> = given
+        .keys()
+        .map(|k| k.as_str())
+        .filter(|k| !props.contains_key(*k))
+        .collect();
+    let missing: Vec<&str> = spec["inputSchema"]["required"]
+        .as_array()
+        .map(|r| {
+            r.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|k| !given.contains_key(*k))
+                .collect()
+        })
+        .unwrap_or_default();
+    if unknown.is_empty() && missing.is_empty() {
+        return Ok(());
+    }
+    let mut msg = String::from("input: ");
+    if !unknown.is_empty() {
+        msg.push_str(&format!("unknown argument(s) `{}` — ", unknown.join("`, `")));
+    }
+    if !missing.is_empty() {
+        msg.push_str(&format!("missing required `{}` — ", missing.join("`, `")));
+    }
+    let mut allowed: Vec<&String> = props.keys().collect();
+    allowed.sort();
+    msg.push_str(&format!(
+        "{name} takes: {}",
+        allowed.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")
+    ));
+    if given.contains_key("query") && props.contains_key("goal") {
+        msg.push_str(" (did you mean `goal`? this tool's argument is `goal`)");
+    }
+    Err(msg)
+}
+
 fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Result<J, String> {
     reload_if_changed(state);
+    // An argument mistake is an INPUT error: return it as a self-correcting tool
+    // result (isError), never as a JSON-RPC error — the model cannot fix what it
+    // never sees.
+    if let Err(msg) = check_args(name, args) {
+        return Ok(json!({
+            "content": [{"type": "text", "text": msg}],
+            "isError": true
+        }));
+    }
     // Input errors (bad goal syntax, rejected rules, unknown batch id)
     // return as tool results with isError: true so the model can
     // self-correct; JSON-RPC errors are reserved for unknown tools and
@@ -700,7 +765,7 @@ fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Res
             }));
         }
     };
-    let (text, is_error) = match inner {
+    let (mut text, mut is_error) = match inner {
         Ok(t) => (t, false),
         Err(t) => (t, true),
     };
@@ -719,7 +784,15 @@ fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Res
             // was told "ok" for a fact that vanished with the process.
             match state.memory.save(p) {
                 Ok(_) => state.stamp = lemmalog::store::Stamp::of(p),
-                Err(e) => eprintln!("lemmalog-mcp: persist failed: {e}"),
+                Err(e) => {
+                    // The change is real in memory but NOT on disk; saying "ok" here
+                    // loses it silently when the process ends.
+                    eprintln!("lemmalog-mcp: persist failed: {e}");
+                    is_error = true;
+                    text.push_str(&format!(
+                        "\npersist FAILED: {e} — this change is in memory only and will be lost when the server exits; fix LEMMALOG_MCP_PATH and re-apply it"
+                    ));
+                }
             }
         }
     }
