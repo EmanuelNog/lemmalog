@@ -13,13 +13,14 @@
 //!   lemmalog-cli rules   --rules 'reach(X,Z) :- current(X,"dep",Y), reach(Y,Z).'
 //!   lemmalog-cli dump    [--pred current]
 //!
-//! Concurrency: load → mutate → save is atomic-rename, but the CLI and a
-//! live MCP server hold separate in-process copies — coordinate so only
-//! one writes at a time (sub-agent runs while the parent only reads),
-//! or have every writer use the CLI.
+//! Concurrency: the engine takes an exclusive cross-process lock on
+//! `<snapshot>.lock` (the same file the fork's sweep/export/import scripts
+//! `flock`) around the WHOLE load-modify-save cycle, so concurrent agents add
+//! facts instead of replacing each other's. See `write_locked`.
 //!
 //! Env: LEMMALOG_MCP_PATH (snapshot path; required for mutations,
-//! optional for fresh-session queries).
+//! optional for fresh-session queries). LEMMALOG_LOCK_WAIT_MS overrides how
+//! long a writer waits for the lock (default 20000).
 
 #![cfg(feature = "mcp")]
 
@@ -63,23 +64,83 @@ fn load(path: &str) -> (AgentMemory<MockExtractor>, Option<lemmalog::store::Stam
 /// FORK CHANGE: upstream saves unconditionally (`fs::write`), so a concurrent
 /// writer's work is silently replaced. We cannot merge two whole-file states, so
 /// the honest behaviour is to fail loudly and let the caller re-run the command
-/// against the current file.
+/// against the current file. Only reachable by a writer that ignores the lock.
 fn save_checked(
     m: &AgentMemory<MockExtractor>,
     path: &str,
     at_load: Option<lemmalog::store::Stamp>,
-) {
+) -> Result<(), String> {
     if let Some(st) = at_load {
         if lemmalog::store::Stamp::of(path) != Some(st) {
-            eprintln!(
-                "lemmalog-cli: {path} changed while this command was running — refusing to \
+            return Err(format!(
+                "{path} changed while this command was running — refusing to \
                  overwrite another writer's state. Re-run the command."
-            );
-            std::process::exit(3);
+            ));
         }
     }
-    m.save(path).expect("save snapshot");
+    m.save(path)
+        .map_err(|e| format!("save {path} failed: {e}"))
 }
+
+/// How many times a writer re-loads and re-applies its mutation before giving
+/// up. With the lock held this never loops; it is the guard for a writer that
+/// does not take the lock (an older binary, a hand-run script).
+const WRITE_RETRIES: usize = 4;
+
+/// Run `op` against the snapshot under the exclusive store lock.
+///
+/// FORK CHANGE (br-gx5.15): the load and the save happen INSIDE one lock, so
+/// two agents observing different facts both survive. Before this, `load` ran
+/// unlocked and `save_checked` compared stamps — a check-then-write race: two
+/// processes both loaded at stamp S, both saw S unchanged, and both wrote, one
+/// fact vanishing with exit 0 and no log line (P6 T3.3, 3/3).
+///
+/// `op` must be re-runnable: on a stamp change (a writer that skipped the lock)
+/// it is called again against freshly loaded state, so anything it prints would
+/// print twice — callers return their output instead of printing it.
+fn write_locked<T>(
+    path: &str,
+    mut op: impl FnMut(&mut AgentMemory<MockExtractor>) -> T,
+) -> T {
+    let lock = match lemmalog::store::StoreLock::acquire(path) {
+        Ok(l) => l,
+        Err(e) => {
+            // No lock, no write: this is the loud failure the old code lacked.
+            let hint = if e.kind() == std::io::ErrorKind::WouldBlock {
+                "hint: another agent, sweep or export is saving right now — retry in a moment"
+            } else {
+                "hint: the snapshot directory must exist and be writable by this user"
+            };
+            eprintln!("lemmalog-cli: cannot write {path}: {e}\n{hint}");
+            std::process::exit(3);
+        }
+    };
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let (mut m, at_load) = load(path);
+        sync_clock(&mut m);
+        let out = op(&mut m);
+        match save_checked(&m, path, at_load) {
+            Ok(()) => {
+                // Hold the lock until the save is on disk, then release.
+                drop(lock);
+                return out;
+            }
+            Err(e) if attempt < WRITE_RETRIES => {
+                eprintln!(
+                    "lemmalog-cli: {e} (retrying {attempt}/{WRITE_RETRIES} under the store lock)"
+                );
+                continue;
+            }
+            Err(e) => {
+                eprintln!("lemmalog-cli: {e} (gave up after {attempt} attempts)");
+                std::process::exit(3);
+            }
+        }
+    }
+}
+
 
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -126,14 +187,15 @@ fn main() {
     let cmd = args.first().cloned().unwrap_or_default();
     match cmd.as_str() {
         "observe" => {
-            let (mut m, stamp) = load(&snap_path());
-            sync_clock(&mut m);
+            let path = snap_path();
             let text = stdin_or_flag(&args, "--facts");
             let ts = flag(&args, "--ts").and_then(|t| t.parse::<i64>().ok());
-            let ts = ts.unwrap_or(m.engine.now);
-            let (report, dropped) = m.observe_extracted(&text, ts);
-            let _ = m.maintain(m.engine.now);
-            save_checked(&m, &snap_path(), stamp);
+            let (report, dropped) = write_locked(&path, |m| {
+                let ts = ts.unwrap_or(m.engine.now);
+                let (report, dropped) = m.observe_extracted(&text, ts);
+                let _ = m.maintain(m.engine.now);
+                (report, dropped)
+            });
             println!(
                 "added={} updated={} noop={} escalations={}",
                 report.added,
@@ -146,11 +208,9 @@ fn main() {
             }
         }
         "retract" => {
-            let (mut m, stamp) = load(&snap_path());
-            sync_clock(&mut m);
+            let path = snap_path();
             let text = stdin_or_flag(&args, "--facts");
-            let (done, missing, died) = m.retract_facts(&text);
-            save_checked(&m, &snap_path(), stamp);
+            let (done, missing, died) = write_locked(&path, |m| m.retract_facts(&text));
             println!("retracted {} fact(s)", done.len());
             if !died.is_empty() {
                 println!("{} derived fact(s) died:", died.len());
@@ -213,31 +273,40 @@ fn main() {
             println!("{}", m.why(&fact));
         }
         "rules" => {
-            let (mut m, stamp) = load(&snap_path());
-            sync_clock(&mut m);
+            let path = snap_path();
             let rules = stdin_or_flag(&args, "--rules");
-            match m.install_rules(&rules) {
+            let res = write_locked(&path, |m| match m.install_rules(&rules) {
                 Ok(id) => {
                     let n = m.maintain(m.engine.now);
-                    save_checked(&m, &snap_path(), stamp);
+                    Ok((id.clone(), n, m.batch_conflicts(&id)))
+                }
+                Err(e) => Err(format!("install: {e}")),
+            });
+            match res {
+                Ok((id, n, conflicts)) => {
                     println!("installed {id}; backfill derived +{n} facts");
-                    for w in m.batch_conflicts(&id) {
+                    for w in conflicts {
                         println!("WARNING: {w}");
                     }
                 }
                 Err(e) => {
-                    eprintln!("install: {e}");
+                    eprintln!("{e}");
                     std::process::exit(1);
                 }
             }
         }
         "rmrules" => {
-            let (mut m, stamp) = load(&snap_path());
-            sync_clock(&mut m);
+            let path = snap_path();
             let id = flag(&args, "--id").expect("--id <batch>");
-            if m.uninstall_rules(&id) {
-                let _ = m.maintain(m.engine.now);
-                save_checked(&m, &snap_path(), stamp);
+            let removed = write_locked(&path, |m| {
+                if m.uninstall_rules(&id) {
+                    let _ = m.maintain(m.engine.now);
+                    true
+                } else {
+                    false
+                }
+            });
+            if removed {
                 println!("uninstalled {id}; derivations reverted");
             } else {
                 eprintln!("no batch {id:?} (see: lemmalog-cli batches)");

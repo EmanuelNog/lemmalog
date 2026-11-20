@@ -133,6 +133,56 @@ escalation path.
 **Test:** `cargo test --release --features mcp --test agent_test backdated` and
 `out_of_order_fact_never_closes_a_newer_edge`.
 
+## 8. Concurrent writers take one lock across load-modify-save
+
+**Upstream:** nothing. `save` is `std::fs::write` and no binary coordinates with any other
+process. Two `lemmalog-cli observe` runs that start together both load at the same stamp and
+both write: one fact disappears with **exit 0 and no log line** (P6 acceptance T3.3, 3/3).
+The fork's shell scripts `flock` `$SNAP.lock` by hand, which is why the symptom only showed
+up once agents wrote through the engine instead of the scripts.
+
+**Ours:** `store::StoreLock` — an exclusive `flock(2)` on `<snapshot>.lock`, the same file the
+sweep/export/import scripts use (verified: a CLI write waits out a `flock(1)` holder). No crate
+is added for it; the lock is one `extern "C" { fn flock(..) }` declaration. Both binaries hold
+it across the WHOLE cycle:
+
+- `lemmalog-cli`: `write_locked` locks, loads, mutates, re-checks the stamp and saves before
+  releasing. A stamp change under the lock (a writer that skipped it) re-loads and re-applies
+  the mutation up to 4 times, then exits 3 with the reason. Waiting 20 s for the lock and
+  still not getting it is also exit 3 — never a write without the lock.
+- `lemmalog-mcp`: `tool_call` takes the lock for the mutating tools (`observe`, `retract`,
+  `install_rules`, `uninstall`, `canonicalize`, `save`), reloads inside it, and persists
+  inside it. Read-only tools do not lock.
+
+Wording matters here: a busy store (another writer) and an unwritable one (bad path,
+permissions) both answer an `isError` result, but each says which it is — "retry" is the
+wrong advice for `EACCES`.
+
+**Files:** `src/store.rs` (`StoreLock`, `lock_path`, `DEFAULT_LOCK_WAIT_MS`),
+`src/bin/lemmalog-cli.rs` (`write_locked`, 4 call sites), `src/bin/lemmalog-mcp.rs`
+(`is_mutating`, `tool_call` wrapper around `tool_call_inner`, `acquire_store_lock`).
+
+**Test:** `cargo test --release --features mcp --test concurrency_lock_test` — real processes,
+not threads: 6 CLI observers released by a barrier file, 5 rounds, every fact must survive and
+nobody may exit 3; plus a live MCP server racing the CLI on one snapshot. Non-unix targets get
+no lock (documented in `store.rs`, unpatched).
+
+## 9. A save keeps the store's mode
+
+**Upstream:** `fs::write` on the temp path (and `File::create` before that) uses `0666 & !umask`,
+so a save rewrites the snapshot 0644 no matter what it was. Measured twice (P3, P4): the live
+`memory.snap` was 0600 and every engine save put it back to 0644 — the store is the user's
+entire assertion history and the mode is the only thing keeping it private on a shared host.
+
+**Ours:** `write_atomic` reads the target's mode and creates the temp with it (`0600` when the
+store is new), via `OpenOptions::mode` on a `create_new` open, so `rename` keeps that mode.
+
+**Files:** `src/store.rs` — `write_atomic`, `DEFAULT_STORE_MODE`, `create_private`.
+
+**Test:** `cargo test --release --features mcp --lib store::` →
+`write_atomic_keeps_the_store_mode`; end to end,
+`--test concurrency_lock_test cli_save_keeps_a_0600_store_private`.
+
 ---
 
 ## Encoding a multi-valued fact that also needs revision
@@ -167,10 +217,10 @@ replaced" — a set needs the group key in its name.
 
 ## Known weaknesses we have NOT patched
 
-- **No cross-process merge.** Two writers still converge to *last whole file*; we
-  removed the silent clobber, the torn read and the failed-write-answered-as-success,
-  not the lost update. A real fix needs a lock taken across read-modify-write in both
-  binaries (a `libc`/`fs2` dependency = a Cargo change and a wider merge surface).
+- **No cross-process merge.** Two writers now serialise (§8), so neither loses a fact — but the
+  unit of sharing is still *last whole file wins*, in turn. A writer that ignores the lock (an
+  old binary, a hand-run script) is detected by the stamp re-check under the lock: the write is
+  retried, then refused with exit 3. Merging two divergent in-memory states remains unsupported.
 - **Extraction quality, not the store, is the ceiling.** The host model writes the
   facts; the engine only derives. Measured on MemDerive: goals whose vocabulary the
   store never received score 0 no matter how correct the store's mechanics are. Bash

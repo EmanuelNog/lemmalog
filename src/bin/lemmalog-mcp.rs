@@ -371,7 +371,137 @@ fn check_args(name: &str, args: &J) -> Result<(), String> {
     Err(msg)
 }
 
+/// Tools whose call mutates the snapshot. Those run under the store lock and
+/// are persisted before the call returns; read-only tools do neither.
+fn is_mutating(name: &str) -> bool {
+    matches!(
+        name,
+        "lemmalog_observe"
+            | "lemmalog_retract"
+            | "lemmalog_install_rules"
+            | "lemmalog_uninstall"
+            | "lemmalog_canonicalize"
+    )
+}
+
+/// Attempts before a mutation that raced a non-locking writer is abandoned.
+const WRITE_RETRIES: usize = 4;
+
+/// FORK ADDITION (br-gx5.15): every mutating tool call runs under the
+/// cross-process store lock, held from `reload_if_changed` through the save.
+///
+/// `reload_if_changed` alone was not enough: it narrowed the window in which a
+/// second writer's facts could be replaced, but the server's load-modify-save
+/// was still unguarded, so a CLI `observe` landing between this server's reload
+/// and its save vanished (measured: 6 of 16 facts lost across the two
+/// surfaces). The lock is the same `<snapshot>.lock` the CLI and the fork's
+/// shell scripts take.
 fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Result<J, String> {
+    let Some(p) = path else {
+        // No persistence configured: nothing to serialise against.
+        return tool_call_inner(state, name, args, path);
+    };
+    if !is_mutating(name) {
+        // `lemmalog_save` included: it persists the in-memory copy, so it needs
+        // the same exclusion a mutation does.
+        if name == "lemmalog_save" {
+            let _lock = match acquire_store_lock(p) {
+                Ok(l) => l,
+                Err(res) => return Ok(res),
+            };
+            let res = tool_call_inner(state, name, args, Some(p));
+            state.stamp = lemmalog::store::Stamp::of(p);
+            return res;
+        }
+        return tool_call_inner(state, name, args, path);
+    }
+    let _lock = match acquire_store_lock(p) {
+        Ok(l) => l,
+        Err(res) => return Ok(res),
+    };
+    for attempt in 1..=WRITE_RETRIES {
+        reload_if_changed(state);
+        let at_load = state.stamp;
+        let res = tool_call_inner(state, name, args, Some(p))?;
+        if res["isError"].as_bool().unwrap_or(false) {
+            return Ok(res); // rejected input: nothing to persist
+        }
+        // A writer that skipped the lock (older binary, hand-run script) could
+        // still have written during the call. The stamp is the witness.
+        if lemmalog::store::Stamp::of(p) != at_load {
+            eprintln!(
+                "lemmalog-mcp: {p} changed during {name} (attempt {attempt}/{WRITE_RETRIES}); \
+                 reloading and retrying"
+            );
+            continue;
+        }
+        return Ok(match state.memory.save(p) {
+            Ok(()) => {
+                state.stamp = lemmalog::store::Stamp::of(p);
+                res
+            }
+            Err(e) => {
+                // The change is real in memory but NOT on disk; saying "ok" here
+                // loses it silently when the process ends.
+                eprintln!("lemmalog-mcp: persist failed: {e}");
+                persist_failed(res, &format!("{e}"))
+            }
+        });
+    }
+    // Every attempt raced a writer that skipped the lock: refuse, loudly.
+    Ok(json!({
+        "content": [{"type": "text", "text": format!(
+            "persist FAILED: {p} kept changing during {name} ({WRITE_RETRIES} attempts) — \
+             another writer is racing this store without taking {}. Nothing was overwritten; \
+             re-apply the change once that writer finishes.",
+            lemmalog::store::lock_path(p)
+        )}],
+        "isError": true
+    }))
+}
+
+/// Take the store lock or produce the tool result that reports the failure.
+///
+/// Two different failures wear the same shape: a *busy* store (another writer
+/// holds the lock — retry) and an *unwritable* one (bad path, permissions —
+/// retrying will not help). Both are `isError` results carrying "persist
+/// FAILED", because in both cases nothing was applied.
+fn acquire_store_lock(p: &str) -> Result<lemmalog::store::StoreLock, J> {
+    match lemmalog::store::StoreLock::acquire(p) {
+        Ok(l) => Ok(l),
+        Err(e) => {
+            eprintln!("lemmalog-mcp: cannot lock {p}: {e}");
+            let why = if e.kind() == std::io::ErrorKind::WouldBlock {
+                format!(
+                    "store busy: {e}\nNothing was written. Retry in a moment; \
+                     concurrent agents are safe to run, this one just timed out."
+                )
+            } else {
+                format!(
+                    "cannot write the snapshot: {e}\nNothing was written — not to disk and not \
+                     in memory. Fix LEMMALOG_MCP_PATH (its directory must exist and be writable), \
+                     then re-apply the change."
+                )
+            };
+            Err(json!({
+                "content": [{"type": "text", "text": format!("persist FAILED: {why}")}],
+                "isError": true
+            }))
+        }
+    }
+}
+
+/// Decorate a successful tool result with a persist failure, keeping its text.
+fn persist_failed(res: J, err: &str) -> J {
+    let mut text = res["content"][0]["text"].as_str().unwrap_or_default().to_string();
+    text.push_str(&format!(
+        "\npersist FAILED: {err} — this change is in memory only and will be lost when the \
+         server exits; re-apply it"
+    ));
+    json!({"content": [{"type": "text", "text": text}], "isError": true})
+}
+
+fn tool_call_inner(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Result<J, String> {
     reload_if_changed(state);
     // An argument mistake is an INPUT error: return it as a self-correcting tool
     // result (isError), never as a JSON-RPC error — the model cannot fix what it
@@ -772,37 +902,12 @@ fn tool_call(state: &mut State, name: &str, args: &J, path: Option<&str>) -> Res
             }));
         }
     };
-    let (mut text, mut is_error) = match inner {
+    let (text, is_error) = match inner {
         Ok(t) => (t, false),
         Err(t) => (t, true),
     };
-    if !is_error
-        && matches!(
-            name,
-            "lemmalog_observe"
-                | "lemmalog_retract"
-                | "lemmalog_install_rules"
-                | "lemmalog_uninstall"
-                | "lemmalog_canonicalize"
-        )
-    {
-        if let Some(p) = path {
-            // FORK ADDITION: a failed persist used to be swallowed, so the model
-            // was told "ok" for a fact that vanished with the process.
-            match state.memory.save(p) {
-                Ok(_) => state.stamp = lemmalog::store::Stamp::of(p),
-                Err(e) => {
-                    // The change is real in memory but NOT on disk; saying "ok" here
-                    // loses it silently when the process ends.
-                    eprintln!("lemmalog-mcp: persist failed: {e}");
-                    is_error = true;
-                    text.push_str(&format!(
-                        "\npersist FAILED: {e} — this change is in memory only and will be lost when the server exits; fix LEMMALOG_MCP_PATH and re-apply it"
-                    ));
-                }
-            }
-        }
-    }
+    // No persist here on purpose: `tool_call` saves mutating calls under the
+    // store lock, after re-checking the stamp (br-gx5.15).
     Ok(json!({
         "content": [{"type": "text", "text": text}],
         "isError": is_error
