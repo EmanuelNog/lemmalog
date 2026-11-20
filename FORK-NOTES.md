@@ -115,6 +115,24 @@ tool description).
 **Test:** `cargo test --release --features mcp --test ground_query`,
 `tests/interop_store.py`.
 
+## 7. A backdated fact never closes a newer edge
+
+**Upstream:** `apply_update` closes every open row for an exclusive relation at the new fact's
+ts, including a row whose `valid_from` is *later*: `observe` v2.0.0 @2000 then v1.5.0 @1500
+leaves `edge(2.0.0, VF=2000, VT=1500)` — an interval valid never — reports `updated=1`, and
+`current/3` then answers 1.5.0 only. `retract` matches open rows, so the newer value is gone.
+
+**Ours:** a row whose `VF` is greater than the fact's ts is never closed by it. The fact
+becomes closed history `[ts, min(VF))`, closes only rows that started at or before it, and
+is counted in `IngestReport::historical` (not yet printed by `lemmalog-cli`, which this
+package does not own). Equal ts still supersedes; non-exclusive relations keep their ADD +
+escalation path.
+
+**Files:** `src/agent.rs` — `IngestReport::historical`, `apply_update`, `assert_historical`.
+
+**Test:** `cargo test --release --features mcp --test agent_test backdated` and
+`out_of_order_fact_never_closes_a_newer_edge`.
+
 ---
 
 ## Encoding a multi-valued fact that also needs revision

@@ -324,6 +324,10 @@ pub struct IngestReport {
     pub added: usize,
     pub updated: usize,
     pub noop: usize,
+    /// Facts whose `ts` was older than an open edge's `valid_from`. They are
+    /// recorded as closed history and never become current, so they neither
+    /// displace the newer value nor produce an interval valid never.
+    pub historical: usize,
     pub escalations: Vec<String>,
 }
 
@@ -438,6 +442,8 @@ impl<X: Extractor> AgentMemory<X> {
     /// - open fact with same (S,P,O)       -> NOOP (annotation merge)
     /// - open fact with different O:
     ///     - P exclusive                   -> UPDATE (close old, assert new)
+    ///       a fact older than an open edge's valid_from is HISTORY: it never
+    ///       closes that edge and never becomes current (`report.historical`)
     ///     - otherwise                     -> ADD + escalation
     fn apply_update(&mut self, c: &CandidateFact, ep: &Episode, report: &mut IngestReport) {
         let subj = self.engine.sym(&c.subj);
@@ -509,15 +515,33 @@ impl<X: Extractor> AgentMemory<X> {
         let functional = FUNCTIONAL.iter().any(|f| pred_name.starts_with(f));
         let exclusive = functional || !self.engine.query("exclusive", &[Some(pred)]).is_empty();
         if exclusive && !multi {
-            for old in &open {
+            // An open edge whose valid_from is LATER than this fact's ts must
+            // not be closed by it (br-gx5.13). Closing it wrote
+            // VF=2000,VT=1500 — an interval valid never — and the newer value
+            // was unrecoverable, because `retract` only matches open rows.
+            // Such a fact is history the caller is filling in: it closes the
+            // rows that started at or before it, takes a closed interval that
+            // ends where the next one begins, and never becomes current.
+            let now = self.engine.now;
+            let (newer, older): (Vec<&Vec<Value>>, Vec<&Vec<Value>>) = open
+                .iter()
+                .partition(|k| matches!(k[3].as_int(), Some(vf) if vf > now));
+            for old in older {
                 let mut closed = old.clone();
-                closed[4] = Value::Int(self.engine.now);
+                closed[4] = Value::Int(now);
                 self.engine.retract("edge", old);
                 self.engine
                     .declare("edge", &closed, Ann::base(0.9, ["superseded"]));
             }
-            self.assert_open(&[subj, pred, obj], c.confidence, &ep.id);
-            report.updated += 1;
+            if let Some(end) = newer.iter().filter_map(|k| k[3].as_int()).min() {
+                // newer is non-empty and every row in it carries an integer
+                // valid_from, so `end > now` and the interval cannot invert
+                self.assert_historical(&[subj, pred, obj], end, c.confidence, &ep.id);
+                report.historical += 1;
+            } else {
+                self.assert_open(&[subj, pred, obj], c.confidence, &ep.id);
+                report.updated += 1;
+            }
         } else if multi {
             self.assert_open(&[subj, pred, obj], c.confidence, &ep.id);
             report.added += 1;
@@ -548,6 +572,23 @@ impl<X: Extractor> AgentMemory<X> {
             Value::Int(self.engine.now), // valid_from: when it was true
             Value::Int(i64::MAX),
             Value::Int(wall_seconds()),   // asserted_at: when we learned it
+        ];
+        self.engine.declare("edge", &args, Ann::base(conf, [prov]));
+    }
+
+    /// Record a fact that arrived after a newer one as closed history
+    /// `[ts, end)`. `end` is the valid_from of the next value the store
+    /// already holds, so the interval is the bi-temporal truth of an
+    /// out-of-order observation: it never becomes current, cannot displace
+    /// the newer value, and cannot invert (`end > ts` by construction).
+    fn assert_historical(&mut self, spo: &[Value; 3], end: i64, conf: f64, prov: &str) {
+        let args = vec![
+            spo[0],
+            spo[1],
+            spo[2],
+            Value::Int(self.engine.now), // valid_from: when it was true
+            Value::Int(end),             // valid_to: when the next value took over
+            Value::Int(wall_seconds()),  // asserted_at: when we learned it
         ];
         self.engine.declare("edge", &args, Ann::base(conf, [prov]));
     }

@@ -713,3 +713,168 @@ fn declaring_the_prefix_alone_does_not_make_a_relation_exclusive() {
         "a set-valued relation stays set-valued"
     );
 }
+
+/// Regression, br-gx5.13. A fact whose `ts` is older than an open edge's
+/// `valid_from` used to close that edge anyway. The result was an interval
+/// valid never (`VF=2000, VT=1500`), a silently destroyed newer value, and
+/// `updated=1` in the report — and `retract` could not undo it, because it
+/// only matches open rows.
+#[test]
+fn out_of_order_fact_never_closes_a_newer_edge() {
+    let mut m = mem("");
+    // session A: the store learns v2.0.0, valid from ts=2000
+    assert_eq!(m.observe_at("svc --version--> 2.0.0", 2000).added, 1);
+    m.maintain(2000);
+
+    // session B, older than A, arrives afterwards in wall time
+    let r = m.observe_at("svc --version--> 1.5.0", 1500);
+    assert_eq!(
+        r.updated, 0,
+        "a backdated fact must not supersede the newer one: {r:?}"
+    );
+    m.maintain(2000);
+
+    // current() keeps answering the newer value, and only it
+    assert_eq!(
+        m.ask("current(\"svc\", \"version\", O)").unwrap(),
+        vec!["O=2.0.0".to_string()],
+        "the newer value must stay the current one"
+    );
+
+    // no edge in the store may be valid never
+    let rows = m
+        .engine
+        .query("edge", &[None, None, None, None, None, None]);
+    let inverted: Vec<(i64, i64)> = rows
+        .iter()
+        .filter_map(|(k, _)| match (k[3].as_int(), k[4].as_int()) {
+            (Some(vf), Some(vt)) if vf > vt => Some((vf, vt)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        inverted.is_empty(),
+        "edge rows whose valid_from is after their valid_to: {inverted:?}"
+    );
+    let open = rows
+        .iter()
+        .filter(|(k, _)| matches!(k[4].as_int(), Some(vt) if vt == i64::MAX))
+        .count();
+    assert_eq!(open, 1, "exactly one open edge for the slot");
+}
+
+/// The other half of br-gx5.13: a backdated fact is not discarded, it is
+/// recorded as the closed interval it really was, the newer edge is left
+/// alone, and the slot keeps accepting later values normally.
+#[test]
+fn backdated_fact_is_recorded_as_closed_history() {
+    let mut m = mem("");
+    m.observe_at("svc --version--> 2.0.0", 2000);
+    m.maintain(2000);
+
+    let r = m.observe_at("svc --version--> 1.5.0", 1500);
+    assert_eq!(
+        (r.updated, r.historical),
+        (0, 1),
+        "a backdated fact is reported, not applied as an update: {r:?}"
+    );
+    m.maintain(2000);
+
+    // history is kept as [1500, 2000); the open edge is untouched
+    let mut rows = slot_edges(&m);
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("1.5.0".to_string(), 1500, 2000),
+            ("2.0.0".to_string(), 2000, i64::MAX),
+        ],
+        "the store now knows when 2.0.0 took over"
+    );
+
+    // the guard does not wedge the slot: a later value supersedes normally
+    let r = m.observe_at("svc --version--> 3.0.0", 3000);
+    assert_eq!((r.updated, r.historical), (1, 0), "{r:?}");
+    m.maintain(3000);
+    assert_eq!(
+        m.ask("current(\"svc\", \"version\", O)").unwrap(),
+        vec!["O=3.0.0".to_string()]
+    );
+
+    // and an EQUAL ts is not "backdated": it supersedes (VF == VT is empty,
+    // not inverted) — the guard must not over-refuse
+    let r = m.observe_at("svc --version--> 3.1.0", 3000);
+    assert_eq!((r.updated, r.historical), (1, 0), "{r:?}");
+    m.maintain(3000);
+    assert_eq!(
+        m.ask("current(\"svc\", \"version\", O)").unwrap(),
+        vec!["O=3.1.0".to_string()]
+    );
+    let inverted = slot_edges(&m).into_iter().filter(|&(_, vf, vt)| vf > vt).count();
+    assert_eq!(inverted, 0);
+}
+
+/// `(object, valid_from, valid_to)` for every `edge` row in the store —
+/// regression tests read the raw intervals, not `current/3`, because the bug
+/// they guard is precisely a row `current/3` cannot show.
+fn slot_edges(m: &lemmalog::AgentMemory<MockExtractor>) -> Vec<(String, i64, i64)> {
+    m.engine
+        .query("edge", &[None, None, None, None, None, None])
+        .iter()
+        .map(|(k, _)| {
+            (
+                m.engine.interner.display(&k[2]),
+                k[3].as_int().unwrap_or(-1),
+                k[4].as_int().unwrap_or(-1),
+            )
+        })
+        .collect()
+}
+
+/// Stores written before the guard can already hold two open rows for one
+/// slot. A backdated fact must close only the rows that started at or before
+/// it, and must leave the newer open row exactly as it was.
+#[test]
+fn backdated_fact_closes_only_older_open_rows() {
+    fn plant(m: &mut lemmalog::AgentMemory<MockExtractor>, obj: &str, vf: i64) {
+        let s = m.engine.sym("svc");
+        let p = m.engine.sym("version");
+        let o = m.engine.sym(obj);
+        m.engine.declare(
+            "edge",
+            &[
+                s,
+                p,
+                o,
+                Value::Int(vf),
+                Value::Int(i64::MAX),
+                Value::Int(1),
+            ],
+            lemmalog::Ann::unit(),
+        );
+    }
+
+    let mut m = mem("");
+    plant(&mut m, "1.0.0", 1000);
+    plant(&mut m, "2.0.0", 2000);
+
+    let r = m.observe_at("svc --version--> 1.5.0", 1500);
+    assert_eq!((r.updated, r.historical), (0, 1), "{r:?}");
+    m.maintain(2000);
+
+    let mut rows = slot_edges(&m);
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("1.0.0".to_string(), 1000, 1500),
+            ("1.5.0".to_string(), 1500, 2000),
+            ("2.0.0".to_string(), 2000, i64::MAX),
+        ],
+        "only the row the fact supersedes is closed"
+    );
+    assert_eq!(
+        m.ask("current(\"svc\", \"version\", O)").unwrap(),
+        vec!["O=2.0.0".to_string()]
+    );
+}
