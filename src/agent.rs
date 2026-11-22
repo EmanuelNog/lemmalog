@@ -484,7 +484,11 @@ impl<X: Extractor> AgentMemory<X> {
         // supersede without needing an explicit `exclusive()` declare
         // (without this, status(H, supported) left status(H, proposed)
         // open too — both "true" at once)
-        const MULTI: [&str; 15] = [
+        // Multi-valued relations (policy: skills/software-development/lemmalog/
+        // references/relation-policy.md). A subject legitimately holds many of these, so a
+        // new value must not close the previous one. `path` and `sha` were being declared
+        // exclusive per store, which made 171 of 172 paths look superseded.
+        const MULTI: [&str; 18] = [
             "evidence",
             "mentions",
             "located",
@@ -500,6 +504,9 @@ impl<X: Extractor> AgentMemory<X> {
             "symptom_of",
             "aka",
             "alias_of",
+            "path",
+            "sha",
+            "note",
         ];
         const FUNCTIONAL: [&str; 7] = [
             "status",
