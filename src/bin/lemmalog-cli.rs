@@ -189,7 +189,35 @@ fn main() {
         "observe" => {
             let path = snap_path();
             let text = stdin_or_flag(&args, "--facts");
-            let ts = flag(&args, "--ts").and_then(|t| t.parse::<i64>().ok());
+            // A bad --ts used to vanish: `.and_then(parse.ok())` turned a typo into None, so
+            // `--ts abc` silently stored at "now" and reported success (measured 2026-11-22).
+            let ts = match flag(&args, "--ts") {
+                None => None,
+                Some(raw) => match raw.trim().parse::<i64>() {
+                    Ok(v) => Some(v),
+                    Err(_) => {
+                        eprintln!("usage: --ts takes whole epoch seconds (got {raw:?})");
+                        std::process::exit(2);
+                    }
+                },
+            };
+            if let Some(v) = ts {
+                // Mirror of the sweep's future_ts_problem (br-gx5.2), which exists because
+                // `--ts` SETS the store clock: a future-dated fact is not one wrong row, it
+                // holds that (subject, relation) `current` until real time catches up and the
+                // engine refuses every true fact for the slot in the meantime.
+                if let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                    let now = d.as_secs() as i64;
+                    if v > now + 300 {
+                        eprintln!(
+                            "refused: --ts {v} is {}s in the future (tolerance 300s) — a \
+future-dated fact freezes its slot until real time catches up",
+                            v - now
+                        );
+                        std::process::exit(2);
+                    }
+                }
+            }
             let (report, dropped) = write_locked(&path, |m| {
                 let ts = ts.unwrap_or(m.engine.now);
                 let (report, dropped) = m.observe_extracted(&text, ts);
@@ -223,9 +251,15 @@ fn main() {
             }
         }
         "query" => {
+            // Checked BEFORE the store is opened: a usage slip must not touch the snapshot (on a
+            // live host that is the real store) and must not report an internal parse error.
+            let goal = stdin_or_flag(&args, "--goal");
+            if goal.trim().is_empty() {
+                eprintln!("usage: lemmalog-cli query --goal '<goal>'   (e.g. current(S, R, O))");
+                std::process::exit(2);
+            }
             let (mut m, _stamp) = load(&snap_path());
             sync_clock(&mut m);
-            let goal = stdin_or_flag(&args, "--goal");
             // FORK CHANGE (chk-n5va.161): a fully-ground goal is a yes/no
             // question. `ask` answers it with a single row that has no
             // bindings — printed as a blank line, exactly like "no answers" —
@@ -297,7 +331,15 @@ fn main() {
         }
         "rmrules" => {
             let path = snap_path();
-            let id = flag(&args, "--id").expect("--id <batch>");
+            // A missing flag is a usage mistake, not a crash: `.expect()` here panicked with
+            // `thread 'main' panicked at ...: --id <batch>`, which reads like engine corruption.
+            let id = match flag(&args, "--id") {
+                Some(v) if !v.trim().is_empty() => v,
+                _ => {
+                    eprintln!("usage: lemmalog-cli rmrules --id <batch>   (list ids with `batches`)");
+                    std::process::exit(2);
+                }
+            };
             let removed = write_locked(&path, |m| {
                 if m.uninstall_rules(&id) {
                     let _ = m.maintain(m.engine.now);

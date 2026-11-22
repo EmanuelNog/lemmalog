@@ -104,18 +104,33 @@ fn entity_token_problem(s: &str) -> Option<String> {
         Some(format!(
             "'{s}' is a pronoun or role word — resolve it to the entity's real name"
         ))
-    } else if s.len() > 60 || s.split_whitespace().count() > 8 {
-        Some("looks like prose (more than 8 words) — entity names are short".to_string())
+    } else if s.len() > 60 {
+        // Separate branches on purpose: a 5000-character single token used to be reported as
+        // "more than 8 words", which sent the operator looking for prose that was not there.
+        Some(format!(
+            "too long ({} bytes, limit 60) — entity names are short",
+            s.len()
+        ))
+    } else if s.split_whitespace().count() > 8 {
+        Some(format!(
+            "looks like prose ({} words, limit 8) — entity names are short",
+            s.split_whitespace().count()
+        ))
     } else if !s.chars().any(|c| c.is_whitespace()) && s.len() <= 60 {
         // a single token accepts all printable characters: kernel-code
         // facts need `*pmap`, `entry->next`, `MAP_FIXED|MAP_ANON`,
         // `vm_fault_entry()` — and since the line protocol already
         // parsed the line, a `-->` can't be hiding inside. Punctuation
         // plus SPACES remains the leaked-deliberation signature below.
-        if s.chars().all(|c| c.is_ascii_graphic()) {
+        // Unicode alphanumerics count as name characters, exactly as they already did on the
+        // spaced path below (`c.is_alphanumeric()`). Requiring ASCII here made `café` storable
+        // only as `café com leite` — the accent was allowed with a space and refused without.
+        if s.chars().all(|c| c.is_ascii_graphic() || c.is_alphanumeric()) {
             None
         } else {
-            Some("contains control characters".to_string())
+            // Reached only for non-ASCII punctuation and real control characters now that
+            // Unicode alphanumerics are accepted above.
+            Some("contains a control character or non-alphanumeric non-ASCII — use plain letters".to_string())
         }
     } else if !s
         .chars()
@@ -1360,5 +1375,53 @@ impl<X: Extractor> AgentMemory<X> {
         let _ = m.engine.run();
         m.last_turn_epoch = m.engine.epoch();
         Ok(m)
+    }
+}
+
+
+#[cfg(test)]
+mod entity_message_tests {
+    //! The diagnostic must name the real cause: a wrong reason is a bug even when the drop is
+    //! correct, because it sends the operator looking in the wrong place.
+
+    use super::*;
+
+    #[test]
+    fn a_long_single_token_is_too_long_not_prose() {
+        let long = "x".repeat(5000);
+        let msg = entity_token_problem(&long).expect("must be refused");
+        assert!(msg.contains("too long"), "{msg}");
+        assert!(
+            !msg.contains("prose"),
+            "5000 characters is ONE word; calling it prose is a false diagnosis: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_many_word_phrase_is_prose() {
+        let msg = entity_token_problem("one two three four five six seven eight nine")
+            .expect("must be refused");
+        assert!(msg.contains("prose"), "{msg}");
+        assert!(msg.contains("9 words"), "{msg}");
+    }
+
+    #[test]
+    fn an_accented_single_token_is_a_name() {
+        // The spaced path already accepted `café com leite`; refusing `café` alone made the
+        // accent depend on the presence of a space (measured 2026-11-22).
+        assert!(entity_token_problem("café").is_none());
+        assert!(entity_token_problem("ação").is_none());
+        assert!(entity_token_problem("açúcar").is_none());
+    }
+
+    #[test]
+    fn non_ascii_punctuation_is_still_refused_and_named() {
+        let msg = entity_token_problem("smile\u{263A}").expect("must be refused");
+        assert!(msg.contains("non-alphanumeric") || msg.contains("control"), "{msg}");
+    }
+
+    #[test]
+    fn a_real_control_character_is_still_refused() {
+        assert!(entity_token_problem("a\u{0}b").is_some());
     }
 }
