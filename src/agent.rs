@@ -90,6 +90,30 @@ impl Extractor for MockExtractor {
 
 /// Why an entity token fails strict validation, as a self-correcting
 /// reason (echoed to the model that produced it).
+/// A character that can be seen in a name: everything except control characters, whitespace
+/// and the Unicode invisible/format set (zero-width, bidi overrides, BOM).
+fn is_visible(c: char) -> bool {
+    if c.is_control() || c.is_whitespace() {
+        return false;
+    }
+    !matches!(
+        c as u32,
+        0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x2069 | 0xFEFF
+    )
+}
+
+/// Characters that end a sentence or bracket a list. Prose in this store is signalled by these,
+/// so they stay refused inside a spaced name; everything else visible (`± ° → ≤ = %`) is a unit
+/// or an operator and is legitimate (`transform 3 = 270°`, `port 3012→3002`, `≤200 ms`).
+fn allowed_in_spaced_name(c: char) -> bool {
+    // the space is the point of a spaced name, and is_visible() excludes whitespace
+    // `?` and `!` belong here: an existing engine test caught `products? maybe not because
+    // generic` sailing through the first version of this predicate.
+    c == ' '
+        || (is_visible(c)
+            && !matches!(c, ',' | ';' | '?' | '!' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '`'))
+}
+
 fn entity_token_problem(s: &str) -> Option<String> {
     // unresolved-reference words: pronouns and role placeholders that mean
     // the model failed to resolve the entity
@@ -122,27 +146,36 @@ fn entity_token_problem(s: &str) -> Option<String> {
         // `vm_fault_entry()` — and since the line protocol already
         // parsed the line, a `-->` can't be hiding inside. Punctuation
         // plus SPACES remains the leaked-deliberation signature below.
-        // Unicode alphanumerics count as name characters, exactly as they already did on the
-        // spaced path below (`c.is_alphanumeric()`). Requiring ASCII here made `café` storable
-        // only as `café com leite` — the accent was allowed with a space and refused without.
-        if s.chars().all(|c| c.is_ascii_graphic() || c.is_alphanumeric()) {
+        // Any VISIBLE character is a name character; the refusal is about invisibility, not
+        // provenance. Requiring ASCII cost real facts: `270°`, `3012→3002`, `±175 chars`,
+        // `≤200 ms`, `café` were all dropped by this branch (13 recorded drops), and the
+        // accent was storable only when a space followed it. Control, whitespace and the
+        // Unicode invisible/format characters remain refused — those are the ones that can
+        // hide a second value inside one token.
+        if s.chars().all(is_visible) {
             None
         } else {
-            // Reached only for non-ASCII punctuation and real control characters now that
-            // Unicode alphanumerics are accepted above.
-            Some("contains a control character or non-alphanumeric non-ASCII — use plain letters".to_string())
+            // Reached only for control, whitespace or an invisible/format character now.
+            Some("contains a control or invisible character — names must be visible text".to_string())
         }
     } else if !s
         .chars()
-        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '\'' | ' ' | '/' | '.' | ':' | '#'))
+        .all(allowed_in_spaced_name)
     {
-        Some("contains punctuation or prose characters — space-free tokens may use any printable characters; spaced names use letters, digits, '_', '-', apostrophes, and '/', '.', ':', '#'".to_string())
+        Some("contains sentence punctuation or invisible characters — spaced names take visible text (letters, digits, units) but not ',', ';' or brackets, which signal prose".to_string())
     } else if s.contains(' ') && s.chars().any(|c| matches!(c, '/' | '.' | ':' | '#')) {
         // Path characters are allowed so that source references
         // (`src/agent.rs:118`) can be entities, but only as single tokens:
         // punctuation *plus* spaces is the signature of leaked prose, which
         // is exactly what strict validation exists to drop.
-        Some("looks like prose — source references must not contain spaces (`src/agent.rs:118`, not `see src/agent.rs, line 118`)".to_string())
+        // Two different things land here, so the message has to cover both: a sentence with full
+        // stops (`Yes. Confirmed.`) and a path/version/IP sitting mid-phrase
+        // (`maps 3012→3002 to 172.18.0.6`). The old text mentioned only source references, which
+        // was wrong for both.
+        Some("'.', '/', ':' or '#' inside a spaced name — that is the leaked-prose or \
+path-in-a-phrase signature. A path, version or IP belongs in its own single token \
+(`~/.hermes/config.yaml`); a sentence is not a name"
+            .to_string())
     } else {
         None
     }
@@ -1415,9 +1448,45 @@ mod entity_message_tests {
     }
 
     #[test]
-    fn non_ascii_punctuation_is_still_refused_and_named() {
-        let msg = entity_token_problem("smile\u{263A}").expect("must be refused");
-        assert!(msg.contains("non-alphanumeric") || msg.contains("control"), "{msg}");
+    fn visible_symbols_are_name_characters() {
+        // These are the plant: every one of them was refused by the ASCII rule (13 drops on
+        // 2026-11-22). None is prose, none can hide a second value.
+        for name in ["270\u{00B0}", "3012\u{2192}3002", "\u{00B1}175", "\u{2264}200ms", "smile\u{263A}"] {
+            assert!(
+                entity_token_problem(name).is_none(),
+                "{name} is visible text and must be storable"
+            );
+        }
+    }
+
+    #[test]
+    fn units_and_operators_are_names_not_prose() {
+        // The 13 facts the ASCII rule refused on 2026-11-22, verbatim. Prose is signalled by
+        // commas and brackets, not by a degree sign.
+        for name in [
+            "transform 3 = 270\u{00B0}",
+            "port 3012\u{2192}3002",
+            "crop window \u{00B1}175 chars",
+            "latency \u{2264}200 ms",
+            "usefulness wobbles \u{00B1}10 points on live DB",
+        ] {
+            assert!(entity_token_problem(name).is_none(), "{name} must store");
+        }
+        // and the prose signals stay refused
+        for prose in ["modifies no game file, memory or code", "completed normally (exit code 0)"] {
+            assert!(entity_token_problem(prose).is_some(), "{prose} must stay refused");
+        }
+    }
+
+    #[test]
+    fn invisible_and_control_characters_are_refused_and_named() {
+        for bad in ["zero\u{200B}width", "bidi\u{202E}swap", "nul\u{0}byte"] {
+            let msg = entity_token_problem(bad).expect("must be refused");
+            assert!(
+                msg.contains("control or invisible"),
+                "reason must name the real cause, got: {msg}"
+            );
+        }
     }
 
     #[test]
