@@ -206,6 +206,15 @@ pub fn parse_protocol_strict(text: &str, default_confidence: f64) -> Vec<Candida
 /// One line of the protocol, or a reason it cannot parse.
 fn parse_line(raw: &str, default_confidence: f64) -> Result<CandidateFact, String> {
     let line = raw.trim();
+    // Two facts crammed onto one line used to merge: `d --status--> four e --status--> five`
+    // stored a single fact whose OBJECT was `four e --status--> five`. The line is ambiguous by
+    // construction (the second `-->` could be a separator or part of the value), so refuse it
+    // instead of silently absorbing one fact into another's value.
+    if line.matches("-->").count() > 1 {
+        return Err(
+            "more than one `-->` on the line — one fact per line (`s --rel--> o`)".to_string(),
+        );
+    }
     let (s, rest) = line
         .split_once("--")
         .ok_or_else(|| "no `--rel-->` structure".to_string())?;
@@ -843,7 +852,34 @@ impl<X: Extractor> AgentMemory<X> {
                 let head = &clauses[0].head;
                 match self.engine.ground_values(&head.args) {
                     Some(args) => self.engine.why(&head.pred, &args),
-                    None => format!("why: {fact} contains variables"),
+                    None => {
+                        // Two different causes shared one message: a variable in the goal
+                        // (`current(A, R, O)`) and an entity the store has never seen
+                        // (`current(a, status, absentvalue)`). Measured 2026-11-22 — the second
+                        // was reported as "contains variables", which is simply untrue and sends
+                        // the reader looking at their query syntax instead of their data.
+                        let mut unknown = Vec::new();
+                        let mut has_var = false;
+                        for t in &head.args {
+                            match t {
+                                Term::Sym(s) if self.engine.interner.lookup(s).is_none() => {
+                                    unknown.push(s.clone())
+                                }
+                                Term::Var(_) | Term::Wildcard => has_var = true,
+                                _ => {}
+                            }
+                        }
+                        if !unknown.is_empty() {
+                            format!(
+                                "why: no such fact — not in the store: {}",
+                                unknown.join(", ")
+                            )
+                        } else if has_var {
+                            format!("why: {fact} contains variables")
+                        } else {
+                            format!("why: {fact} is not in the store")
+                        }
+                    }
                 }
             }
             _ => format!("why: cannot parse {fact:?}"),

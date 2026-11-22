@@ -277,6 +277,19 @@ future-dated fact freezes its slot until real time catches up",
                         } else {
                             println!("{}", rows.join("\n"));
                         }
+                        // A capitalized name in a goal is a VARIABLE in Datalog, but the store
+                        // also allows capitalized entities (`Svc`), so `current(Svc, port, P)`
+                        // silently returns every subject instead of that entity. The parse-error
+                        // path already carries the hint; a SUCCESSFUL query needs it too.
+                        // stderr only: output and exit code are unchanged.
+                        for name in variable_like_names(&goal) {
+                            if m.engine.interner.lookup(&name).is_some() {
+                                eprintln!(
+                                    "hint: '{name}' was read as a variable; it is also an \
+entity. Quote it (\"{name}\") to match that entity."
+                                );
+                            }
+                        }
                     }
                     Err(e) => {
                         eprintln!("parse: {e}\nhint: quote entity names — bare capitalized words are variables");
@@ -301,9 +314,15 @@ future-dated fact freezes its slot until real time catches up",
             print!("{}", m.context_for_query_rich(&query, budget));
         }
         "why" => {
+            // `why current(x, r, o)` positionally used to reach m.why("") and report
+            // `cannot parse ""` — a usage slip dressed as a parse error (measured 2026-11-22).
+            let fact = stdin_or_flag(&args, "--fact");
+            if fact.trim().is_empty() {
+                eprintln!("usage: lemmalog-cli why --fact 'current(s, r, o)'");
+                std::process::exit(2);
+            }
             let (mut m, _stamp) = load(&snap_path());
             sync_clock(&mut m);
-            let fact = stdin_or_flag(&args, "--fact");
             println!("{}", m.why(&fact));
         }
         "rules" => {
@@ -394,4 +413,36 @@ future-dated fact freezes its slot until real time catches up",
             std::process::exit(2);
         }
     }
+}
+
+/// Capitalized words in a goal — the names Datalog reads as variables. Quoted spans are skipped
+/// so a properly quoted entity (`current("Svc", port, P)`) never triggers the hint.
+fn variable_like_names(goal: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    for c in goal.chars() {
+        if c == '"' {
+            in_quotes = !in_quotes;
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        if in_quotes {
+            continue;
+        }
+        if c.is_alphanumeric() || c == '_' {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            words.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
+        .into_iter()
+        .filter(|w| w.chars().next().map(char::is_uppercase).unwrap_or(false))
+        .collect()
 }

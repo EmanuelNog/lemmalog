@@ -371,6 +371,46 @@ fn source_references_are_valid_entities() {
 }
 
 #[test]
+fn why_distinguishes_a_variable_from_an_unknown_entity() {
+    let mut m = mem("");
+    m.observe("a --status--> one");
+    // `current/3` is DERIVED: without a maintenance pass the fact reads as "[unknown fact]",
+    // which is correct engine behaviour and what the CLI does on load.
+    m.maintain(100);
+    // an entity the store has never seen is not a "variable"
+    let absent = m.why("current(a, status, absentvalue)");
+    assert!(absent.contains("not in the store"), "{absent}");
+    assert!(
+        !absent.contains("contains variables"),
+        "a ground goal with an unknown entity is not a variable problem: {absent}"
+    );
+    // a real variable still says so
+    let var = m.why("current(A, status, one)");
+    assert!(var.contains("contains variables"), "{var}");
+    // and a real fact still explains itself
+    let real = m.why("current(a, status, one)");
+    assert!(real.contains("via rule/current"), "{real}");
+}
+
+#[test]
+fn two_facts_on_one_line_are_refused_not_merged() {
+    use lemmalog::agent::parse_protocol_reported;
+    // Measured 2026-11-22: this stored ONE fact whose object was `four e --status--> five`.
+    let (facts, dropped) = parse_protocol_reported("d --status--> four e --status--> five", 1.0);
+    assert!(facts.is_empty(), "must not merge: {facts:?}");
+    assert_eq!(dropped.len(), 1);
+    assert!(
+        dropped[0].1.contains("one fact per line"),
+        "{:?}",
+        dropped[0].1
+    );
+    // `--` inside a value is fine: only a second `-->` makes the line ambiguous
+    let (ok, _) = parse_protocol_reported("cli --note--> use --force and --verbose", 1.0);
+    assert_eq!(ok.len(), 1);
+    assert_eq!(ok[0].obj, "use --force and --verbose");
+}
+
+#[test]
 fn punctuation_with_spaces_is_still_prose() {
     use lemmalog::agent::parse_protocol_reported;
     let (facts, dropped) = parse_protocol_reported(

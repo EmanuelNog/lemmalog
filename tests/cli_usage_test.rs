@@ -38,6 +38,25 @@ fn query_without_goal_is_a_usage_error_not_a_parse_error() {
     );
 }
 
+fn run_with_stdin_env(args: &[&str], input: &str, store: &std::path::Path) -> std::process::Output {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lemmalog-cli"))
+        .args(args)
+        .env("LEMMALOG_MCP_PATH", store)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("binary must spawn");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait")
+}
+
 fn run_with_stdin(args: &[&str], input: &str) -> std::process::Output {
     use std::io::Write;
     let mut child = Command::new(env!("CARGO_BIN_EXE_lemmalog-cli"))
@@ -55,6 +74,41 @@ fn run_with_stdin(args: &[&str], input: &str) -> std::process::Output {
         .write_all(input.as_bytes())
         .expect("write stdin");
     child.wait_with_output().expect("wait")
+}
+
+#[test]
+fn a_capitalized_entity_is_flagged_when_a_goal_reads_it_as_a_variable() {
+    // The store allows `Svc` as an entity, but Datalog reads a bare capitalized word as a
+    // variable, so `current(Svc, port, P)` silently returns every subject. Output stays the same;
+    // the hint goes to stderr.
+    let store = std::env::temp_dir().join(format!("lemmalog-case-{}.snap", std::process::id()));
+    let seed = run_with_stdin_env(&["observe", "--facts"], "Svc --port--> 1\n", &store);
+    assert_eq!(seed.status.code(), Some(0));
+
+    let out = run_with_stdin_env(&["query", "--goal", "current(Svc, port, P)"], "", &store);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("read as a variable"),
+        "must warn that Svc became a variable: {err}"
+    );
+
+    // quoted, it is an entity: no hint
+    let quoted = run_with_stdin_env(&["query", "--goal", "current(\"Svc\", port, P)"], "", &store);
+    let qerr = String::from_utf8_lossy(&quoted.stderr);
+    assert!(
+        !qerr.contains("read as a variable"),
+        "a quoted entity must not be flagged: {qerr}"
+    );
+    let _ = std::fs::remove_file(&store);
+}
+
+#[test]
+fn why_without_fact_is_a_usage_error_not_an_empty_parse() {
+    let out = run(&["why"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {err}");
+    assert!(err.contains("usage:"), "stderr: {err}");
+    assert!(!err.contains("cannot parse"), "stderr: {err}");
 }
 
 #[test]
