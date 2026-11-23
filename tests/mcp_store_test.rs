@@ -174,6 +174,44 @@ fn rules_guards_hold_on_the_mcp_surface_too() {
 }
 
 #[test]
+fn a_checkpoint_from_an_earlier_run_is_flagged_not_called_up_to_date() {
+    // The change feed is in memory and the epoch counter restarts with the process, so a
+    // checkpoint saved by an earlier server run is incomparable. Answering "no changes since
+    // that epoch" would tell a resyncing agent the store is current when nothing is known.
+    let dir = std::env::temp_dir();
+    let store = dir.join(format!("lemmalog-mcp-epoch-{}.snap", std::process::id()));
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_lemmalog-cli"))
+        .args(["observe", "--facts"])
+        .env("LEMMALOG_MCP_PATH", &store)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("cli must spawn");
+    cli.stdin.as_mut().expect("stdin").write_all(b"a --status--> one\n").expect("write");
+    assert!(cli.wait_with_output().expect("wait").status.success());
+
+    let ahead = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"lemmalog_changes","arguments":{"since":99}}}"#;
+    let out = run_server(&store, &[INIT, ahead]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("AHEAD of this store's current epoch"),
+        "an out-of-range checkpoint must be flagged: {text}"
+    );
+    assert!(
+        !text.contains("no changes since that epoch"),
+        "it must not claim the caller is up to date: {text}"
+    );
+
+    // A normal checkpoint still answers plainly.
+    let normal = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"lemmalog_changes","arguments":{"since":0}}}"#;
+    let out2 = run_server(&store, &[INIT, normal]);
+    let text2 = String::from_utf8_lossy(&out2.stdout);
+    assert!(!text2.contains("AHEAD"), "since=0 is never ahead: {text2}");
+    let _ = std::fs::remove_file(&store);
+}
+
+#[test]
 fn a_healthy_store_still_serves() {
     let dir = std::env::temp_dir();
     let store = dir.join(format!("lemmalog-mcp-healthy-{}.snap", std::process::id()));

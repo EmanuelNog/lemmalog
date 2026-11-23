@@ -134,7 +134,7 @@ fn tools() -> J {
             "Query-driven context assembly via hybrid retrieval: BM25 over facts and episodes + entity-match boosting, budget-aware. Input: query (natural language) + optional budget_tokens (default 1000). Returns relevance-selected facts and their verbatim source episodes — use this instead of lemmalog_dump when preparing a grounded answer.", &["query", "budget_tokens"], &["query"]),
         tool("lemmalog_dump", "List facts of a predicate (or all) with confidence and provenance.", &["pred"], &[]),
         tool("lemmalog_changes",
-            "Resync after a context reset or another agent's work: everything asserted, derived, or retracted since an epoch. Input: optional `since` epoch integer (default: 0 = everything, capped). The response carries the current epoch — checkpoint it and pass it back next time.", &["since"], &[]),
+            "Resync after a context reset or another agent's work: everything asserted, derived, or retracted since an epoch. Input: optional `since` epoch integer (default: 0 = everything, capped). The response carries the current epoch — checkpoint it and pass it back next time; epochs belong to one serving process, so pass 0 after a restart.", &["since"], &[]),
         tool("lemmalog_save", "Persist memory to LEMMALOG_MCP_PATH.", &[], &[]),
         tool("lemmalog_run", "Sync the clock to the present and run one maintenance epoch (usually automatic — every read does it).", &[], &[]),
     ])
@@ -595,7 +595,17 @@ fn tool_call_inner(state: &mut State, name: &str, args: &J, path: Option<&str>) 
             let epoch = e.epoch();
             let mut out = format!("epoch={epoch}\n");
             if events.is_empty() {
-                out.push_str("no changes since that epoch");
+                if since > epoch {
+                    // `since` beyond the current epoch means the checkpoint came from an EARLIER
+                    // server run: the feed lives in memory and the counter restarts with the
+                    // process (measured 2026-11-22). Saying "no changes since that epoch" would
+                    // tell a resyncing agent that everything is current when nothing is known.
+                    out.push_str(&format!(
+                        "no changes — but since={since} is AHEAD of this store's current epoch ({epoch}). Epochs reset when the serving process restarts, so a checkpoint from an earlier run cannot be compared: pass since=0 to see everything."
+                    ));
+                } else {
+                    out.push_str("no changes since that epoch");
+                }
             } else {
                 let shown = events.len().min(200);
                 for ev in events.iter().take(shown) {
