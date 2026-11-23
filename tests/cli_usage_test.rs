@@ -77,6 +77,56 @@ fn run_with_stdin(args: &[&str], input: &str) -> std::process::Output {
 }
 
 #[test]
+fn installing_an_empty_rule_set_is_a_usage_error() {
+    // Measured 2026-11-22: `rules --rules ''` printed `installed b1; backfill derived +0 facts`,
+    // creating a batch that derives nothing and cannot be told from a real one in `batches`.
+    let store = std::env::temp_dir().join(format!("lemmalog-empty-{}.snap", std::process::id()));
+    let out = run_with_stdin_env(&["rules", "--rules", "   "], "", &store);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stderr: {err}");
+    assert!(err.contains("usage:"), "stderr: {err}");
+
+    let list = run_with_stdin_env(&["batches"], "", &store);
+    let bouts = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        !bouts.contains("b1:"),
+        "no batch may be created for empty rules: {bouts}"
+    );
+    let _ = std::fs::remove_file(&store);
+}
+
+#[test]
+fn installing_the_same_rules_twice_is_a_no_op() {
+    // Measured 2026-11-22: `rules --rules X` twice created b1 and b2 with identical text and
+    // warned that the definitions UNION. Identical text derives identical facts, so a retry
+    // must not accumulate batches.
+    let store = std::env::temp_dir().join(format!("lemmalog-rules-{}.snap", std::process::id()));
+    let rule = "zz(R) :- false(R).";
+    let first = run_with_stdin_env(&["rules", "--rules", rule], "", &store);
+    let fout = String::from_utf8_lossy(&first.stdout);
+    assert!(fout.contains("installed"), "first install: {fout}");
+
+    let second = run_with_stdin_env(&["rules", "--rules", rule], "", &store);
+    let sout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        sout.contains("already installed"),
+        "a repeat install must say so: {sout}"
+    );
+    assert!(
+        !sout.contains("installed b2"),
+        "a repeat install must not create a second batch: {sout}"
+    );
+    let list = run_with_stdin_env(&["batches"], "", &store);
+    let bouts = String::from_utf8_lossy(&list.stdout);
+    assert_eq!(
+        bouts.matches("zz(R)").count(),
+        1,
+        "exactly one batch must hold the text: {bouts}"
+    );
+    let _ = std::fs::remove_file(&store);
+}
+
+#[test]
 fn a_capitalized_entity_is_flagged_when_a_goal_reads_it_as_a_variable() {
     // The store allows `Svc` as an entity, but Datalog reads a bare capitalized word as a
     // variable, so `current(Svc, port, P)` silently returns every subject. Output stays the same;

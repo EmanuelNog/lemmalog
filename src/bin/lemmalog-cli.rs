@@ -328,16 +328,38 @@ entity. Quote it (\"{name}\") to match that entity."
         "rules" => {
             let path = snap_path();
             let rules = stdin_or_flag(&args, "--rules");
-            let res = write_locked(&path, |m| match m.install_rules(&rules) {
+            // An empty rule set installed a batch that derives nothing (`installed b1; backfill
+            // derived +0 facts`) — noise in `batches` with no way to tell it from a real one.
+            if rules.trim().is_empty() {
+                eprintln!("usage: lemmalog-cli rules --rules '<datalog text>'   (nothing to install)");
+                std::process::exit(2);
+            }
+            let res = write_locked(&path, |m| {
+                // Re-installing the SAME text used to create a second batch and warn that the
+                // definitions UNION (measured 2026-11-22: `rules --rules X` twice gave b1 and
+                // b2). Identical text derives identical facts, so a retry must be a no-op
+                // instead of accumulating duplicate batches.
+                let wanted = rules.trim();
+                for (id, text) in m.rule_batches() {
+                    if text.trim() == wanted {
+                        return Ok((id, 0, Vec::new(), true));
+                    }
+                }
+                match m.install_rules(&rules) {
                 Ok(id) => {
                     let n = m.maintain(m.engine.now);
-                    Ok((id.clone(), n, m.batch_conflicts(&id)))
+                    Ok((id.clone(), n, m.batch_conflicts(&id), false))
                 }
                 Err(e) => Err(format!("install: {e}")),
+                }
             });
             match res {
-                Ok((id, n, conflicts)) => {
-                    println!("installed {id}; backfill derived +{n} facts");
+                Ok((id, n, conflicts, noop)) => {
+                    if noop {
+                        println!("already installed {id}; nothing changed");
+                    } else {
+                        println!("installed {id}; backfill derived +{n} facts");
+                    }
                     for w in conflicts {
                         println!("WARNING: {w}");
                     }
