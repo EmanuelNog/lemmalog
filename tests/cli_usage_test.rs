@@ -27,6 +27,44 @@ fn rmrules_without_id_is_a_usage_error_not_a_panic() {
 }
 
 #[test]
+fn context_without_a_question_is_a_usage_error_not_an_empty_answer() {
+    // `context` used to answer whatever empty query it got: a positional was ignored, so
+    // `context "where does alice work"` printed the empty-query result — exit 0, no facts, no
+    // warning — and with stdin on a pipe it blocked reading it. Measured 2026-11-22.
+    let out = run(&["context"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "stdout: {}", String::from_utf8_lossy(&out.stdout));
+    assert!(err.contains("usage:"), "stderr: {err}");
+}
+
+#[test]
+fn a_positional_question_is_the_question() {
+    // A store the tool must actually read, so the assertion is about the query being used.
+    let dir = std::env::temp_dir().join(format!("lemmalog-ctx-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let store = dir.join("ctx.snap");
+    let seed = Command::new(env!("CARGO_BIN_EXE_lemmalog-cli"))
+        .args(["observe", "--facts", "swordfish --status--> rotating"])
+        .env("LEMMALOG_MCP_PATH", &store)
+        .output()
+        .expect("seed must run");
+    assert!(seed.status.success(), "seed: {}", String::from_utf8_lossy(&seed.stderr));
+
+    let out = Command::new(env!("CARGO_BIN_EXE_lemmalog-cli"))
+        .args(["context", "swordfish status"])   // POSITIONAL, not --query
+        .env("LEMMALOG_MCP_PATH", &store)
+        .output()
+        .expect("context must run");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        text.contains("swordfish --status--> rotating") || text.contains("swordfish, status, rotating"),
+        "the positional must reach retrieval, got: {text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn query_without_goal_is_a_usage_error_not_a_parse_error() {
     let out = run(&["query"]);
     let err = String::from_utf8_lossy(&out.stderr);

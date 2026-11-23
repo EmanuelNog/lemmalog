@@ -148,6 +148,35 @@ fn flag(args: &[String], name: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned().filter(|v| !v.starts_with("--")))
 }
 
+/// Positional words, skipping flags and the values they take.
+///
+/// `context "open a ticket"` looked like it worked: the positional was IGNORED, so the query was
+/// empty (or stdin was read instead), and the tool answered a different question than the one
+/// asked — silently, with exit 0. Measured 2026-11-22: every `lemmalog-cli context <text>` run
+/// returned the empty-query answer, and with stdin on a pipe it blocked forever reading it.
+fn positional_text(args: &[String], value_flags: &[&str]) -> String {
+    let mut words: Vec<String> = Vec::new();
+    let mut skip_next = false;
+    for (i, a) in args.iter().enumerate() {
+        if i == 0 {
+            continue; // the subcommand
+        }
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if a.starts_with("--") {
+            if value_flags.contains(&a.as_str()) {
+                skip_next = true;
+            }
+            continue;
+        }
+        words.push(a.clone());
+    }
+    words.join(" ")
+}
+
+
 fn stdin_or_flag(args: &[String], name: &str) -> String {
     if let Some(v) = flag(args, name) {
         return v;
@@ -305,9 +334,26 @@ entity. Quote it (\"{name}\") to match that entity."
             }
         }
         "context" => {
+            // Order: --query, then the positional, then stdin (the pipe convention). Reading
+            // stdin when a positional was given is what made `context <text>` HANG on a pipe
+            // while looking like a normal call (measured 2026-11-22).
+            let mut query = flag(&args, "--query").unwrap_or_default();
+            if query.trim().is_empty() {
+                query = positional_text(&args, &["--query", "--budget"]);
+            }
+            if query.trim().is_empty() {
+                query = stdin_or_flag(&args, "--query");
+            }
+            // Checked before the store is opened, like `query` and `why`: a usage slip must not
+            // read the live snapshot and must not answer a question nobody asked.
+            if query.trim().is_empty() {
+                eprintln!(
+                    "usage: lemmalog-cli context --query '<question>' [--budget N]\n                            (a positional works too: lemmalog-cli context 'where does alice work')"
+                );
+                std::process::exit(2);
+            }
             let (mut m, _stamp) = load(&snap_path());
             sync_clock(&mut m);
-            let query = stdin_or_flag(&args, "--query");
             let budget = flag(&args, "--budget")
                 .and_then(|b| b.parse::<usize>().ok())
                 .unwrap_or(1000);
