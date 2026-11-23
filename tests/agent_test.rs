@@ -370,6 +370,57 @@ fn source_references_are_valid_entities() {
     assert_eq!(facts[1].obj, "src/agent.rs:92");
 }
 
+/// The SAME list is asserted by the Python export filter
+/// (`test_secret_shapes_are_refused_and_values_kept` in ~/.hermes/scripts/tests/): one rule, two
+/// implementations, pinned by one list so they cannot drift apart unnoticed.
+const SECRET_CASES: [&str; 9] = [
+    "sk-A1b2C3d4E5f6G7h8I9j0",
+    "ghp_aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV1wX2",
+    "xoxb-123456789012-abcdefghij",
+    "Zx9Qw8Er7Ty6Ui5Op4As3Df2Gh1Jk0Lm",
+    "https://user:pw@example.test/x",
+    "postgres://app:secret@db.internal:5432/app",
+    "token=Xk9mP2qR7sT4vW8y",
+    "password=hunter2",
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0",
+];
+const VALUE_CASES: [&str; 6] = [
+    "9f2c1b7a4e6d8035af1c9b2e7d4f6018ab3c5e7d",       // hex sha: a fact shape, never a secret
+    "https://example.test/x",                          // url without credentials
+    "ssh://git@github.com/org/repo.git",               // user, no password
+    "running",
+    "~/.hermes/skills/software-development/lemmalog",
+    "2026-11-22T12:00:00Z",
+];
+
+#[test]
+fn secret_shape_parity_cases() {
+    for s in SECRET_CASES {
+        assert!(lemmalog::agent::secret_shaped(s), "must be refused: {s}");
+    }
+    for s in VALUE_CASES {
+        assert!(!lemmalog::agent::secret_shaped(s), "must be kept: {s}");
+    }
+}
+
+#[test]
+fn observe_refuses_a_credential_and_never_echoes_it() {
+    let (facts, dropped) = lemmalog::agent::parse_protocol_reported(
+        "svc --key--> ghp_aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV1wX2\nsvc --status--> up\n",
+        0.9,
+    );
+    assert_eq!(facts.len(), 1, "only the ordinary fact is stored: {facts:?}");
+    assert_eq!(facts[0].obj, "up");
+    assert_eq!(dropped.len(), 1);
+    let (line, reason) = &dropped[0];
+    assert!(reason.contains("credential"), "{reason}");
+    assert!(
+        !line.contains("ghp_"),
+        "the drop report must not carry the credential: {line}"
+    );
+    assert!(line.contains("<redacted>"), "{line}");
+}
+
 #[test]
 fn why_distinguishes_a_variable_from_an_unknown_entity() {
     let mut m = mem("");

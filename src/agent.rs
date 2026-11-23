@@ -114,6 +114,110 @@ fn allowed_in_spaced_name(c: char) -> bool {
             && !matches!(c, ',' | ';' | '?' | '!' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '`'))
 }
 
+/// True when a name looks like a credential rather than a value.
+///
+/// Deliberately mirrors `is_secret_shaped` in `~/.hermes/scripts/lemmalog-facts-lib.py` — the
+/// engine carries no regex dependency and the Python copy owns the export boundary. The two are
+/// pinned by the SAME case list on both sides (`secret_shape_parity_cases` here,
+/// `test_secret_shapes_are_refused_and_values_kept` there), because a hand-mirrored rule drifts.
+///
+/// Pure hex is NEVER secret: `artifact --sha--> 9f2c…` is a legitimate fact shape here.
+pub fn secret_shaped(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    const PREFIXES: [&str; 8] = [
+        "sk_live_", "sk_test_", "rk_live_", "pk_live_", "sk-", "glpat-", "github_pat_", "hf_",
+    ];
+    for p in PREFIXES {
+        if lower.starts_with(p) && s.len() > p.len() + 7 {
+            return true;
+        }
+    }
+    for p in ["ghp_", "gho_", "ghu_", "ghs_", "ghr_", "xoxb-", "xoxp-", "xoxa-", "xoxo-", "xoxr-"] {
+        if lower.starts_with(p) && s.len() > p.len() + 9 {
+            return true;
+        }
+    }
+    for p in ["AKIA", "ASIA"] {
+        let rest = &s[p.len().min(s.len())..];
+        if s.starts_with(p) && rest.len() == 16 && rest.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
+            return true;
+        }
+    }
+    if let Some(rest) = s.strip_prefix("AIza") {
+        if rest.len() == 35 && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return true;
+        }
+    }
+    if s.starts_with("eyJ") && s.contains('.') && s.len() > 20 {
+        return true; // JWT
+    }
+    if s.contains("BEGIN ") && s.contains("PRIVATE KEY") {
+        return true; // PEM
+    }
+    if let Some(rest) = lower.strip_prefix("bearer ") {
+        if rest.len() >= 12 && !rest.contains(' ') {
+            return true;
+        }
+    }
+    // `scheme://user:password@host` — a URL is a legal fact object, the password rides along.
+    // Measured 2026-11-22: this shape passed every other pattern in the export filter.
+    if let Some((_, after)) = s.split_once("://") {
+        let authority = after.split('/').next().unwrap_or("");
+        if let Some((creds, _host)) = authority.split_once('@') {
+            if let Some((user, pw)) = creds.split_once(':') {
+                if !user.is_empty() && !pw.is_empty() {
+                    return true;
+                }
+            }
+        }
+    }
+    // `token=`/`auth=`/`bearer=` are as often config words as credentials (`auth=required`), so
+    // they only count when the value itself is token-like — the Python side draws the same line.
+    for key in ["token", "auth", "bearer"] {
+        for sep in ['=', ':'] {
+            let needle = format!("{key}{sep}");
+            if let Some(idx) = lower.find(&needle) {
+                let token = s[idx + needle.len()..]
+                    .trim_start()
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                let tokenish = token.len() >= 10
+                    && token.chars().any(|c| c.is_ascii_alphabetic())
+                    && token.chars().any(|c| c.is_ascii_digit());
+                if tokenish {
+                    return true;
+                }
+            }
+        }
+    }
+    for key in ["password", "passwd", "secret", "api_key", "apikey", "access_key", "private_key", "client_secret"] {
+        for sep in ['=', ':'] {
+            let needle = format!("{key}{sep}");
+            if let Some(idx) = lower.find(&needle) {
+                let value = s[idx + needle.len()..].trim_start();
+                let token = value.split_whitespace().next().unwrap_or("");
+                if token.len() >= 6 && token.chars().any(|c| c.is_ascii_digit()) {
+                    return true;
+                }
+            }
+        }
+    }
+    // The general shape: long, from the token alphabets, mixing cases and digits, not pure hex.
+    if s.len() >= 32
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-' | '.'))
+    {
+        let has_upper = s.chars().any(|c| c.is_ascii_uppercase());
+        let has_lower = s.chars().any(|c| c.is_ascii_lowercase());
+        let has_digit = s.chars().any(|c| c.is_ascii_digit());
+        let all_hex = s.chars().all(|c| c.is_ascii_hexdigit());
+        if has_upper && has_lower && has_digit && !all_hex {
+            return true;
+        }
+    }
+    false
+}
+
 fn entity_token_problem(s: &str) -> Option<String> {
     // unresolved-reference words: pronouns and role placeholders that mean
     // the model failed to resolve the entity
@@ -282,8 +386,23 @@ pub fn parse_protocol_reported(
         }
         match parse_line(raw, default_confidence) {
             Ok(c) => {
+                // A credential is not a fact. Everything downstream had to remember this
+                // (the export's filter, the block's renderer, the sweep's own predicate), and
+                // the write path was the one place that did not (br-gx5.68).
+                let secret = secret_shaped(&c.subj) || secret_shaped(&c.obj);
                 let problem = entity_token_problem(&c.subj)
                     .or_else(|| entity_token_problem(&c.obj))
+                    .or_else(|| {
+                        if secret {
+                            Some(
+                                "looks like a credential, not a fact — keep it in the vault; \
+the store is read by every later session"
+                                    .to_string(),
+                            )
+                        } else {
+                            None
+                        }
+                    })
                     .or_else(|| {
                         if c.pred
                             .chars()
@@ -295,7 +414,16 @@ pub fn parse_protocol_reported(
                         }
                     });
                 match problem {
-                    Some(reason) => dropped.push((raw.trim().to_string(), reason)),
+                    Some(reason) => {
+                        // The drop report is printed and logged; a credential in it would leak
+                        // exactly what this rule exists to keep out.
+                        let shown = if secret {
+                            format!("{} --{}--> <redacted>", c.subj, c.pred)
+                        } else {
+                            raw.trim().to_string()
+                        };
+                        dropped.push((shown, reason));
+                    }
                     None => facts.push(c),
                 }
             }
