@@ -46,7 +46,19 @@ fn main() {
         if std::path::Path::new(p).exists() {
             match AgentMemory::load(lemmalog::agent::MockExtractor::new(0.9), p) {
                 Ok(m) => memory = m,
-                Err(e) => eprintln!("lemmalog-mcp: snapshot load failed: {e}"),
+                Err(e) => {
+                    // MEASURED 2026-11-22: continuing with a fresh memory here DESTROYS the
+                    // file on the first mutating tool. A 36-byte non-snapshot became a
+                    // 168-byte fresh store after `observe` + `save`, both of which answered
+                    // isError:false; and `query` claimed "no relation named current" — a false
+                    // statement about the schema when the store was simply unreadable. The CLI
+                    // already refuses to start fresh; this is the same rule one level up.
+                    eprintln!(
+                        "lemmalog-mcp: snapshot load failed ({e}); refusing to start fresh — \
+that would overwrite {p}. Move the file aside to reset."
+                    );
+                    std::process::exit(3);
+                }
             }
         }
     }
