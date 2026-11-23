@@ -719,7 +719,26 @@ impl<X: Extractor> AgentMemory<X> {
 
     /// Agent tool surface: install a rule batch (versioned, revertable).
     pub fn install_rules(&mut self, src: &str) -> Result<String, Box<dyn std::error::Error>> {
+        // Empty text used to install a batch that derives nothing, indistinguishable in the
+        // batch list from a real one (measured 2026-11-22). Refused HERE rather than in the CLI
+        // so the MCP tool cannot do what the CLI refuses.
+        if src.trim().is_empty() {
+            return Err("nothing to install (empty rule text)".into());
+        }
         self.engine.install_program(src)
+    }
+
+    /// The id of an installed batch whose text is identical (after trimming), if any.
+    ///
+    /// Re-installing the SAME text used to create a second batch and warn that the definitions
+    /// union; identical text derives identical facts, so a retry must be a no-op. Shared by the
+    /// CLI and the MCP tool — a guard in one surface only is how the two drift apart.
+    pub fn batch_with_text(&self, src: &str) -> Option<String> {
+        let wanted = src.trim();
+        self.rule_batches()
+            .into_iter()
+            .find(|(_, text)| text.trim() == wanted)
+            .map(|(id, _)| id)
     }
 
     /// Predicates this batch (co-)defines that another installed batch
@@ -1529,4 +1548,40 @@ mod entity_message_tests {
     fn a_real_control_character_is_still_refused() {
         assert!(entity_token_problem("a\u{0}b").is_some());
     }
+}
+
+/// Capitalized words in a goal — the names Datalog reads as variables. Quoted spans are
+/// skipped, so a properly quoted entity (`current("Svc", port, P)`) never triggers the hint.
+///
+/// Both surfaces need this: the store allows capitalized entities (`Svc`, `Sunshine`,
+/// `AGENTS.md` — 66 of 724 live subjects), yet a bare capitalized word in a goal binds a
+/// VARIABLE and silently returns every subject.
+pub fn variable_like_names(goal: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    for c in goal.chars() {
+        if c == '"' {
+            in_quotes = !in_quotes;
+            if !cur.is_empty() {
+                words.push(std::mem::take(&mut cur));
+            }
+            continue;
+        }
+        if in_quotes {
+            continue;
+        }
+        if c.is_alphanumeric() || c == '_' {
+            cur.push(c);
+        } else if !cur.is_empty() {
+            words.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        words.push(cur);
+    }
+    words
+        .into_iter()
+        .filter(|w| w.chars().next().map(char::is_uppercase).unwrap_or(false))
+        .collect()
 }

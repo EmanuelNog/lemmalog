@@ -282,7 +282,7 @@ future-dated fact freezes its slot until real time catches up",
                         // silently returns every subject instead of that entity. The parse-error
                         // path already carries the hint; a SUCCESSFUL query needs it too.
                         // stderr only: output and exit code are unchanged.
-                        for name in variable_like_names(&goal) {
+                        for name in lemmalog::agent::variable_like_names(&goal) {
                             if m.engine.interner.lookup(&name).is_some() {
                                 eprintln!(
                                     "hint: '{name}' was read as a variable; it is also an \
@@ -339,11 +339,8 @@ entity. Quote it (\"{name}\") to match that entity."
                 // definitions UNION (measured 2026-11-22: `rules --rules X` twice gave b1 and
                 // b2). Identical text derives identical facts, so a retry must be a no-op
                 // instead of accumulating duplicate batches.
-                let wanted = rules.trim();
-                for (id, text) in m.rule_batches() {
-                    if text.trim() == wanted {
-                        return Ok((id, 0, Vec::new(), true));
-                    }
+                if let Some(id) = m.batch_with_text(&rules) {
+                    return Ok((id, 0, Vec::new(), true));
                 }
                 match m.install_rules(&rules) {
                 Ok(id) => {
@@ -437,34 +434,3 @@ entity. Quote it (\"{name}\") to match that entity."
     }
 }
 
-/// Capitalized words in a goal — the names Datalog reads as variables. Quoted spans are skipped
-/// so a properly quoted entity (`current("Svc", port, P)`) never triggers the hint.
-fn variable_like_names(goal: &str) -> Vec<String> {
-    let mut words: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut in_quotes = false;
-    for c in goal.chars() {
-        if c == '"' {
-            in_quotes = !in_quotes;
-            if !cur.is_empty() {
-                words.push(std::mem::take(&mut cur));
-            }
-            continue;
-        }
-        if in_quotes {
-            continue;
-        }
-        if c.is_alphanumeric() || c == '_' {
-            cur.push(c);
-        } else if !cur.is_empty() {
-            words.push(std::mem::take(&mut cur));
-        }
-    }
-    if !cur.is_empty() {
-        words.push(cur);
-    }
-    words
-        .into_iter()
-        .filter(|w| w.chars().next().map(char::is_uppercase).unwrap_or(false))
-        .collect()
-}

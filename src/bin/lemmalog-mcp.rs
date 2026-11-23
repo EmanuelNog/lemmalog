@@ -191,35 +191,6 @@ fn tool(name: &str, desc: &str, props: &[&str], required: &[&str]) -> J {
     })
 }
 
-/// Parse `pred(Arg1, Arg2, ...)` into a predicate and bare argument
-/// strings (quotes stripped). Every argument must be a constant — entity
-/// names arrive ground regardless of case.
-fn parse_fact_atom(s: &str) -> Result<(String, Vec<String>), String> {
-    let s = s.trim().trim_end_matches('.');
-    let open = s
-        .find('(')
-        .ok_or_else(|| format!("expected pred(args): {s:?}"))?;
-    let close = s
-        .rfind(')')
-        .ok_or_else(|| format!("expected pred(args): {s:?}"))?;
-    if close <= open {
-        return Err(format!("expected pred(args): {s:?}"));
-    }
-    let pred = s[..open].trim().to_string();
-    if pred.is_empty() {
-        return Err(format!("missing predicate: {s:?}"));
-    }
-    let args: Vec<String> = s[open + 1..close]
-        .split(',')
-        .map(|a| a.trim().trim_matches('"').to_string())
-        .map(|a| a.trim_matches('"').to_string())
-        .collect();
-    if args.iter().any(|a| a.is_empty()) {
-        return Err(format!("empty argument in {s:?} (why needs a ground fact)"));
-    }
-    Ok((pred, args))
-}
-
 fn engine_of(state: &mut State) -> &mut Engine {
     &mut state.memory.engine
 }
@@ -654,15 +625,26 @@ fn tool_call_inner(state: &mut State, name: &str, args: &J, path: Option<&str>) 
             // FORK CHANGE (chk-n5va.161): a fully-ground goal is a yes/no
             // question — answer `true`/`false` instead of an empty string,
             // which an agent cannot tell apart from "no answers".
+            // The same hint the CLI prints: a capitalized word in a goal is a VARIABLE, and the
+            // store allows capitalized entities (66 of 724 live subjects), so a bare `Svc`
+            // silently matches every subject instead of that entity.
+            let mut hint = String::new();
+            for name in lemmalog::agent::variable_like_names(&goal) {
+                if state.memory.engine.interner.lookup(&name).is_some() {
+                    hint.push_str(&format!(
+                        "\nhint: '{name}' was read as a variable; it is also an entity. Quote it (\"{name}\") to match that entity."
+                    ));
+                }
+            }
             match engine_of(state).holds(&goal) {
-                Ok(Some(t)) => Ok(if t { "true".to_string() } else { "false".to_string() }),
+                Ok(Some(t)) => Ok(format!("{}{hint}", if t { "true" } else { "false" })),
                 // variables: bindings, as before (parse errors surface here too)
                 _ => match engine_of(state).ask(&goal) {
-                    Ok(rows) => Ok(if rows.is_empty() {
+                    Ok(rows) => Ok(format!("{}{hint}", if rows.is_empty() {
                         empty_query_hint(engine_of(state), &goal)
                     } else {
                         rows.join("\n")
-                    }),
+                    })),
                     Err(e) => Err(format!(
                         "parse: could not parse goal `{}`\nreason: {e}\nhint: quote entity names — bare capitalized words are variables. Example: reports_to(\"Alice\", Y)",
                         truncate(&goal, 120)
@@ -688,24 +670,23 @@ fn tool_call_inner(state: &mut State, name: &str, args: &J, path: Option<&str>) 
         "lemmalog_why" => {
             let fact = args["fact"].as_str().unwrap_or_default().to_string();
             sync_clock(state);
-            match parse_fact_atom(&fact) {
-                Ok((pred, parts)) => {
-                    let vals: Vec<Value> = parts
-                        .iter()
-                        .map(|a| match a.parse::<i64>() {
-                            Ok(i) => Value::Int(i),
-                            Err(_) => state.memory.engine.sym(a),
-                        })
-                        .collect();
-                    Ok(state.memory.engine.why(&pred, &vals))
-                }
-                Err(e) => Err(format!("input: {e}\nexample: reports_to(Alice, Carol)")),
-            }
+            // MEASURED 2026-11-22: this branch had its own comma-splitting parser and called
+            // `engine.why` directly, so the SAME question answered differently on the two
+            // surfaces — the CLI said "why: no such fact — not in the store: absentvalue"
+            // while MCP said "[unknown fact]". It also interned every argument as a side effect
+            // (`engine.sym`), so asking about a typo grew the symbol table. `AgentMemory::why`
+            // is the one implementation both surfaces should use.
+            Ok(state.memory.why(&fact))
         }
         "lemmalog_install_rules" => {
-            let rules = args["rules"].as_str().unwrap_or_default();
+            let rules = args["rules"].as_str().unwrap_or_default().to_string();
             sync_clock(state);
-            match state.memory.install_rules(rules) {
+            // Same guard as the CLI (shared helper): identical text is a no-op, empty text is an
+            // error from `install_rules` — so neither surface can drift from the other.
+            if let Some(id) = state.memory.batch_with_text(&rules) {
+                return Ok(format!("already installed {id}; nothing changed").into());
+            }
+            match state.memory.install_rules(&rules) {
                 Ok(id) => {
                     let n = engine_of(state).run();
                     let mut out = format!("installed {id}; backfill derived +{n} facts");
