@@ -163,6 +163,10 @@ fn rules_guards_hold_on_the_mcp_surface_too() {
         sout.contains("already installed"),
         "a repeat install must be a no-op over MCP: {sout}"
     );
+    assert!(
+        sout.contains("\"content\"") && sout.contains("\"isError\":false"),
+        "the no-op must be a proper tool result, not a bare string: {sout}"
+    );
 
     let empty = run_server(&store, &[INIT, &install(4, "")]);
     let eout = String::from_utf8_lossy(&empty.stdout);
@@ -208,6 +212,80 @@ fn a_checkpoint_from_an_earlier_run_is_flagged_not_called_up_to_date() {
     let out2 = run_server(&store, &[INIT, normal]);
     let text2 = String::from_utf8_lossy(&out2.stdout);
     assert!(!text2.contains("AHEAD"), "since=0 is never ahead: {text2}");
+    let _ = std::fs::remove_file(&store);
+}
+
+#[test]
+fn a_timestamp_checkpoint_survives_a_process_restart() {
+    // The trigger for resync is a context reset, which starts a NEW process — and an epoch
+    // checkpoint cannot cross one. A timestamp checkpoint can, because every `edge` row carries
+    // its own validity window: opened = vf > ts, closed = vt > ts and vt != MAX. This test does
+    // the whole thing across three separate processes.
+    let dir = std::env::temp_dir();
+    let store = dir.join(format!("lemmalog-mcp-tscp-{}.snap", std::process::id()));
+    let observe = |facts: &str| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_lemmalog-cli"))
+            .args(["observe", "--facts"])
+            .env("LEMMALOG_MCP_PATH", &store)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("cli must spawn");
+        c.stdin.as_mut().expect("stdin").write_all(facts.as_bytes()).expect("write");
+        assert!(c.wait_with_output().expect("wait").status.success());
+    };
+    let changes_since = |ts: i64| {
+        let call = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"lemmalog_changes","arguments":{{"since_ts":{ts}}}}}}}"#
+        );
+        let out = run_server(&store, &[INIT, &call]);
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    // Process 1: a first fact.
+    observe("a --status--> one\n");
+    let after_first = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // Process 2: supersede it and add another.
+    observe("a --status--> two\nb --status--> new\n");
+
+    // Process 3: ask with the checkpoint taken after process 1.
+    let text = changes_since(after_first);
+    // Envelope first: a `return` that escapes the dispatcher yields a bare string result, which
+    // still CONTAINS the right text and still passes a text-only assertion.
+    assert!(
+        text.contains("\"content\"") && text.contains("\"isError\":false"),
+        "the response must be a proper tool result: {text}"
+    );
+    assert!(
+        !text.contains("\"result\":\""),
+        "a bare string result means the envelope was skipped: {text}"
+    );
+    assert!(text.contains("+ edge(a, status, two"), "the addition must appear: {text}");
+    assert!(text.contains("+ edge(b, status, new"), "the second addition must appear: {text}");
+    assert!(text.contains("- edge(a, status, one"), "the retraction must appear: {text}");
+    assert!(!text.contains("+ edge(a, status, two, 0"), "no placeholder rows: {text}");
+
+    // A checkpoint taken now reports nothing new.
+    // The response is JSON on stdout, so newlines arrive escaped (`\n` as two characters):
+    // take the digits after `now_ts=` rather than splitting on a newline that is not there.
+    let now_ts: i64 = text
+        .split("now_ts=")
+        .nth(1)
+        .expect("response carries now_ts")
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .expect("now_ts is an integer");
+    let text2 = changes_since(now_ts);
+    assert!(
+        text2.contains("no edges opened or closed"),
+        "a fresh checkpoint must be quiet: {text2}"
+    );
     let _ = std::fs::remove_file(&store);
 }
 

@@ -134,7 +134,7 @@ fn tools() -> J {
             "Query-driven context assembly via hybrid retrieval: BM25 over facts and episodes + entity-match boosting, budget-aware. Input: query (natural language) + optional budget_tokens (default 1000). Returns relevance-selected facts and their verbatim source episodes — use this instead of lemmalog_dump when preparing a grounded answer.", &["query", "budget_tokens"], &["query"]),
         tool("lemmalog_dump", "List facts of a predicate (or all) with confidence and provenance.", &["pred"], &[]),
         tool("lemmalog_changes",
-            "Resync after a context reset or another agent's work: everything asserted, derived, or retracted since an epoch. Input: optional `since` epoch integer (default: 0 = everything, capped). The response carries the current epoch — checkpoint it and pass it back next time; epochs belong to one serving process, so pass 0 after a restart.", &["since"], &[]),
+            "Resync after a context reset or another agent's work. Preferred: `since_ts` (unix seconds) — reports every edge OPENED or CLOSED since that instant, derived from the store itself, so it survives restarts; checkpoint the `now_ts` the response prints. Alternative: `since` (epoch integer) — in-process only; a checkpoint from an earlier run cannot be compared, so pass 0 after a restart.", &["since", "since_ts"], &[]),
         tool("lemmalog_save", "Persist memory to LEMMALOG_MCP_PATH.", &[], &[]),
         tool("lemmalog_run", "Sync the clock to the present and run one maintenance epoch (usually automatic — every read does it).", &[], &[]),
     ])
@@ -589,7 +589,52 @@ fn tool_call_inner(state: &mut State, name: &str, args: &J, path: Option<&str>) 
         }
         "lemmalog_changes" => {
             let since = args["since"].as_i64().unwrap_or(0).max(0) as u64;
+            let since_ts = args["since_ts"].as_i64();
             sync_clock(state);
+            let out = if let Some(ts) = since_ts {
+                // A TIMESTAMP checkpoint, derived from the store itself. The engine's change
+                // feed lives in memory and the epoch restarts with the process (measured
+                // 2026-11-22), so an epoch checkpoint cannot survive a restart — the trigger for
+                // resync IS a restart. Every `edge` row carries its own validity window, so the
+                // delta is reconstructible: opened = vf > ts, closed = vt > ts and vt != MAX.
+                let e = engine_of(state);
+                let mut opened: Vec<String> = Vec::new();
+                let mut closed: Vec<String> = Vec::new();
+                for key in e.relation_keys("edge") {
+                    let ints: Vec<i64> = key
+                        .iter()
+                        .filter_map(|v| match v {
+                            Value::Int(i) => Some(*i),
+                            _ => None,
+                        })
+                        .collect();
+                    if ints.len() != 3 {
+                        continue;
+                    }
+                    let (vf, vt) = (ints[0], ints[1]);
+                    if vf > ts {
+                        opened.push(e.render_fact("edge", &key));
+                    } else if vt != i64::MAX && vt > ts {
+                        closed.push(e.render_fact("edge", &key));
+                    }
+                }
+                let now_ts = e.now;
+                let mut out = format!("now_ts={now_ts}\n");
+                if opened.is_empty() && closed.is_empty() {
+                    out.push_str(&format!("no edges opened or closed since ts={ts}"));
+                } else {
+                    for f in opened.iter().take(200) {
+                        out.push_str(&format!("\n+ {f}"));
+                    }
+                    for f in closed.iter().take(200) {
+                        out.push_str(&format!("\n- {f}"));
+                    }
+                    out.push_str(&format!(
+                        "\ncheckpoint: pass since_ts={now_ts} next time"
+                    ));
+                }
+                out
+            } else {
             let e = engine_of(state);
             let events = e.changes_since(since);
             let epoch = e.epoch();
@@ -627,6 +672,8 @@ fn tool_call_inner(state: &mut State, name: &str, args: &J, path: Option<&str>) 
                 }
                 out.push_str(&format!("checkpoint: pass since={epoch} next time"));
             }
+            out
+            };
             Ok(out)
         }
         "lemmalog_query" => {
@@ -694,7 +741,10 @@ fn tool_call_inner(state: &mut State, name: &str, args: &J, path: Option<&str>) 
             // Same guard as the CLI (shared helper): identical text is a no-op, empty text is an
             // error from `install_rules` — so neither surface can drift from the other.
             if let Some(id) = state.memory.batch_with_text(&rules) {
-                return Ok(format!("already installed {id}; nothing changed").into());
+                return Ok(json!({
+                    "content": [{"type": "text", "text": format!("already installed {id}; nothing changed")}],
+                    "isError": false
+                }));
             }
             match state.memory.install_rules(&rules) {
                 Ok(id) => {
