@@ -279,6 +279,30 @@ future-dated fact freezes its slot until real time catches up",
                 println!("not found: {mi}");
             }
         }
+        "close" => {
+            let path = snap_path();
+            let text = stdin_or_flag(&args, "--facts");
+            let (done, missing, died) = write_locked(&path, |m| m.close_facts(&text));
+            println!("closed {} fact(s) (kept as history, tombstoned)", done.len());
+            if !died.is_empty() {
+                println!("{} derived fact(s) died:", died.len());
+                for d in died.iter().take(15) {
+                    println!("  {d}");
+                }
+            }
+            for mi in &missing {
+                println!("not found: {mi}");
+            }
+        }
+        "reopen" => {
+            let path = snap_path();
+            let text = stdin_or_flag(&args, "--facts");
+            let (done, missing) = write_locked(&path, |m| m.reopen_facts(&text));
+            println!("reopened {} fact(s)", done.len());
+            for mi in &missing {
+                println!("no tombstone: {mi}");
+            }
+        }
         "query" => {
             // Checked BEFORE the store is opened: a usage slip must not touch the snapshot (on a
             // live host that is the real store) and must not report an internal parse error.

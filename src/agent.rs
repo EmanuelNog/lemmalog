@@ -513,6 +513,9 @@ pub struct IngestReport {
     /// recorded as closed history and never become current, so they neither
     /// displace the newer value nor produce an interval valid never.
     pub historical: usize,
+    /// Facts an observe tried to add while a tombstone covered the triple
+    /// (br-gx5.91): the close is deliberate, so the sweep must not revive it.
+    pub suppressed: usize,
     pub escalations: Vec<String>,
 }
 
@@ -642,6 +645,16 @@ impl<X: Extractor> AgentMemory<X> {
             Ok(n) => Value::Int(n),
             Err(_) => self.engine.sym(&c.obj),
         };
+        // br-gx5.91: a tombstoned triple stays closed until `reopen` lifts it. Without this
+        // gate the open.is_empty() branch below re-adds poison on the very next sweep.
+        if !self
+            .engine
+            .query("tombstone", &[Some(subj), Some(pred), Some(obj), None])
+            .is_empty()
+        {
+            report.suppressed += 1;
+            return;
+        }
         let open: Vec<Vec<Value>> = self
             .engine
             .query("edge", &[Some(subj), Some(pred), None, None, None, None])
@@ -1068,12 +1081,108 @@ impl<X: Extractor> AgentMemory<X> {
         r.render(&sel)
     }
 
+    /// Close an open edge instead of deleting it: `valid_to = now` plus a
+    /// `tombstone(S, R, O, closed_at)` base fact that gates re-assertion
+    /// (br-gx5.91). A mistaken close stays recoverable — the row keeps its
+    /// interval and `reopen` brings it back — which `retract`, by decision,
+    /// deliberately does not promise.
+    pub fn close_facts(&mut self, text: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
+        let candidates = parse_protocol_strict(text, 0.9);
+        let now = self.engine.now;
+        let mut done = Vec::new();
+        let mut missing = Vec::new();
+        for c in &candidates {
+            let subj = self.engine.sym(&c.subj);
+            let pred = self.engine.sym(&c.pred);
+            let obj = match c.obj.parse::<i64>() {
+                Ok(n) => Value::Int(n),
+                Err(_) => self.engine.sym(&c.obj),
+            };
+            let open: Vec<Vec<Value>> = self
+                .engine
+                .query("edge", &[Some(subj), Some(pred), Some(obj), None, None, None])
+                .into_iter()
+                .map(|(k, _)| k)
+                .filter(|k| matches!(k[4].as_int(), Some(vt) if vt == i64::MAX))
+                .collect();
+            if open.is_empty() {
+                missing.push(format!("{} --{}--> {}", c.subj, c.pred, c.obj));
+                continue;
+            }
+            for row in &open {
+                let mut closed = row.clone();
+                closed[4] = Value::Int(now);
+                self.engine.retract("edge", row);
+                self.engine.declare("edge", &closed, Ann::base(0.9, ["closed"]));
+            }
+            let tomb = vec![subj, pred, obj, Value::Int(now)];
+            self.engine.declare("tombstone", &tomb, Ann::base(0.95, ["closed"]));
+            done.push(format!("{} --{}--> {}", c.subj, c.pred, c.obj));
+        }
+        if done.is_empty() {
+            return (done, missing, Vec::new());
+        }
+        let derived_preds: Vec<String> = self.engine.ever_derived.iter().cloned().collect();
+        let mut before: std::collections::BTreeMap<String, std::collections::BTreeSet<Vec<Value>>> =
+            std::collections::BTreeMap::new();
+        for p in &derived_preds {
+            before.insert(p.clone(), self.engine.relation_keys(p).into_iter().collect());
+        }
+        self.maintain(now);
+        let mut died = Vec::new();
+        for (p, old_keys) in &before {
+            let now_keys: std::collections::BTreeSet<Vec<Value>> =
+                self.engine.relation_keys(p).into_iter().collect();
+            for k in old_keys.difference(&now_keys) {
+                died.push(self.engine.render_fact(p, k));
+            }
+        }
+        (done, missing, died)
+    }
+
+    /// Lift the tombstone covering (S, R, O) and re-assert the edge as open.
+    pub fn reopen_facts(&mut self, text: &str) -> (Vec<String>, Vec<String>) {
+        let candidates = parse_protocol_strict(text, 0.9);
+        let now = self.engine.now;
+        let mut done = Vec::new();
+        let mut missing = Vec::new();
+        for c in &candidates {
+            let subj = self.engine.sym(&c.subj);
+            let pred = self.engine.sym(&c.pred);
+            let obj = match c.obj.parse::<i64>() {
+                Ok(n) => Value::Int(n),
+                Err(_) => self.engine.sym(&c.obj),
+            };
+            let tombs: Vec<Vec<Value>> = self
+                .engine
+                .query("tombstone", &[Some(subj), Some(pred), Some(obj), None])
+                .into_iter()
+                .map(|(k, _)| k)
+                .collect();
+            if tombs.is_empty() {
+                missing.push(format!("{} --{}--> {}", c.subj, c.pred, c.obj));
+                continue;
+            }
+            for row in &tombs {
+                self.engine.retract("tombstone", row);
+            }
+            let still_open = self
+                .engine
+                .query("edge", &[Some(subj), Some(pred), Some(obj), None, None, None])
+                .into_iter()
+                .map(|(k, _)| k)
+                .filter(|k| matches!(k[4].as_int(), Some(vt) if vt == i64::MAX))
+                .count();
+            if still_open == 0 {
+                self.assert_open(&[subj, pred, obj], 0.9, "reopen");
+            }
+            done.push(format!("{} --{}--> {}", c.subj, c.pred, c.obj));
+        }
+        self.maintain(now);
+        (done, missing)
+    }
+
     /// Retract base facts given in the line protocol. Each open `edge`
-    /// row matching (S, R, O) is removed; `maintain()` then recomputes
-    /// the transitive dependents (scoped negative delta). Returns
-    /// (retracted lines, not-found lines, derived facts that died) —
-    /// the consequence report is the point: the caller sees exactly
-    /// what invalidation propagated.
     pub fn retract_facts(&mut self, text: &str) -> (Vec<String>, Vec<String>, Vec<String>) {
         let candidates = parse_protocol_strict(text, 0.9);
         let mut done = Vec::new();

@@ -969,3 +969,52 @@ fn backdated_fact_closes_only_older_open_rows() {
         vec!["O=2.0.0".to_string()]
     );
 }
+
+#[test]
+fn mistaken_close_is_reversible_and_a_deliberate_close_survives_the_next_sweep() {
+    let mut m = mem("");
+    m.observe_at("alice --status--> up", 1000);
+    m.maintain(1000);
+    assert!(m
+        .ask("current(\"alice\", \"status\", O)")
+        .unwrap()
+        .iter()
+        .any(|r| r.contains("up")));
+
+    let (closed, missing, _died) = m.close_facts("alice --status--> up");
+    assert_eq!(closed.len(), 1);
+    assert!(missing.is_empty());
+
+    // the row is HISTORY now, not gone: same triple, valid_to == close time
+    let closed_rows: Vec<Vec<Value>> = m
+        .engine
+        .query("edge", &[None, None, None, None, None, None])
+        .into_iter()
+        .map(|(k, _)| k)
+        .filter(|k| k[4].as_int() == Some(1000))
+        .collect();
+    assert!(!closed_rows.is_empty(), "a closed edge must remain readable");
+    assert!(
+        !m.engine
+            .query("tombstone", &[None, None, None, None])
+            .is_empty(),
+        "close must leave a tombstone"
+    );
+
+    // the next sweep cannot revive a deliberate close
+    let r = m.observe_at("alice --status--> up", 2000);
+    assert_eq!(r.suppressed, 1, "re-assertion must be suppressed");
+    m.maintain(2000);
+    assert!(m.ask("current(\"alice\", \"status\", O)").unwrap().is_empty());
+
+    // a mistaken close is reversible
+    let (reopened, missing) = m.reopen_facts("alice --status--> up");
+    assert_eq!(reopened.len(), 1);
+    assert!(missing.is_empty());
+    m.maintain(3000);
+    assert!(m
+        .ask("current(\"alice\", \"status\", O)")
+        .unwrap()
+        .iter()
+        .any(|r| r.contains("up")));
+}
