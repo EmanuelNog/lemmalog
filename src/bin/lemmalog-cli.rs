@@ -254,10 +254,11 @@ future-dated fact freezes its slot until real time catches up",
                 (report, dropped)
             });
             println!(
-                "added={} updated={} noop={} escalations={}",
+                "added={} updated={} noop={} suppressed={} escalations={}",
                 report.added,
                 report.updated,
                 report.noop,
+                report.suppressed,
                 report.escalations.len()
             );
             for d in dropped.iter().take(5) {
