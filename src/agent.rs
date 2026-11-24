@@ -218,6 +218,33 @@ pub fn secret_shaped(s: &str) -> bool {
     false
 }
 
+/// Relations whose object IS a hex digest of a known width — the only case where pure hex is a
+/// fact rather than a credential (br-gx5.93). Mirrors `_HEX_LEN_BY_RELATION` in
+/// lemmalog-facts-lib.py; tests/secret_corpus.tsv is read by both suites so the two cannot drift.
+pub const HEX_DIGEST_RELATIONS: [(&str, usize); 4] =
+    [("sha", 40), ("sha256", 64), ("md5", 32), ("container_id", 64)];
+
+/// The object half of the secret rule: WHAT the object is, given the relation carrying it.
+///
+/// A pure-hex object of 32+ chars is a credential unless the relation names that exact digest
+/// and the object is that many LOWERCASE hex chars. `secret_shaped` alone refuses every full
+/// sha and misses none of the hex shapes; this is the split the decision asked for.
+pub fn secret_shaped_object(obj: &str, relation: &str) -> bool {
+    if secret_shaped(obj) {
+        return true;
+    }
+    let t = obj.trim();
+    if t.len() >= 32 && t.chars().all(|c| c.is_ascii_hexdigit()) {
+        let lowercase = !t.chars().any(|c| c.is_ascii_uppercase());
+        let rel = relation.trim().to_ascii_lowercase();
+        let named = HEX_DIGEST_RELATIONS
+            .iter()
+            .any(|(r, n)| *r == rel.as_str() && t.len() == *n);
+        return !(lowercase && named);
+    }
+    false
+}
+
 fn entity_token_problem(s: &str) -> Option<String> {
     // unresolved-reference words: pronouns and role placeholders that mean
     // the model failed to resolve the entity
@@ -389,7 +416,7 @@ pub fn parse_protocol_reported(
                 // A credential is not a fact. Everything downstream had to remember this
                 // (the export's filter, the block's renderer, the sweep's own predicate), and
                 // the write path was the one place that did not (br-gx5.68).
-                let secret = secret_shaped(&c.subj) || secret_shaped(&c.obj);
+                let secret = secret_shaped(&c.subj) || secret_shaped_object(&c.obj, &c.pred);
                 let problem = entity_token_problem(&c.subj)
                     .or_else(|| entity_token_problem(&c.obj))
                     .or_else(|| {

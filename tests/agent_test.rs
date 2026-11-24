@@ -394,6 +394,30 @@ const VALUE_CASES: [&str; 6] = [
 ];
 
 #[test]
+fn the_secret_corpus_is_honoured_on_both_sides() {
+    // tests/secret_corpus.tsv is read by the Python suite too: that shared file is the
+    // anti-drift contract for br-gx5.93, and it pins the hex-digest exemption per relation.
+    let corpus = include_str!("secret_corpus.tsv");
+    let mut seen = 0;
+    for line in corpus.lines() {
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut it = line.split('\t');
+        let obj = it.next().expect("object column");
+        let rel = it.next().expect("relation column");
+        let want = it.next().expect("expected column");
+        seen += 1;
+        assert_eq!(
+            lemmalog::agent::secret_shaped_object(obj, rel),
+            want == "secret",
+            "corpus row disagreed: {obj} --{rel}--> {want}"
+        );
+    }
+    assert!(seen >= 15, "corpus has too few rows to pin anything: {seen}");
+}
+
+#[test]
 fn secret_shape_parity_cases() {
     for s in SECRET_CASES {
         assert!(lemmalog::agent::secret_shaped(s), "must be refused: {s}");
