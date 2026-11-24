@@ -254,12 +254,14 @@ future-dated fact freezes its slot until real time catches up",
                 (report, dropped)
             });
             println!(
-                "added={} updated={} noop={} suppressed={} escalations={}",
+                // The sweep parses this line with `added=.. updated=.. noop=.. escalations=..`:
+                // new fields go at the END, or every count silently reads zero (br-gx5.85).
+                "added={} updated={} noop={} escalations={} suppressed={}",
                 report.added,
                 report.updated,
                 report.noop,
-                report.suppressed,
-                report.escalations.len()
+                report.escalations.len(),
+                report.suppressed
             );
             for d in dropped.iter().take(5) {
                 println!("dropped: {} ({})", d.0, d.1);
