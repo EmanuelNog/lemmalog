@@ -172,3 +172,20 @@ fn semantic_rerank_surfaces_lexical_gaps() {
         sel.fact_lines
     );
 }
+
+#[test]
+fn tombstone_bookkeeping_is_not_retrieved_as_a_fact() {
+    // Tombstone rows are state bookkeeping, like `edge`: indexing them spends
+    // the context budget on a line that says only "this was closed", with no
+    // relation to the question's subject beyond lexical overlap.
+    let mut m = mem();
+    m.observe_at("alice --status--> up", 100);
+    m.maintain(100);
+    m.close_facts("alice --status--> up");
+    let r = Retrieval::build(&m.engine, m.episodes());
+    let lines = r.fact_renders();
+    assert!(
+        lines.iter().all(|l| !l.starts_with("tombstone(")),
+        "tombstone is bookkeeping, not a retrievable fact: {lines:?}"
+    );
+}

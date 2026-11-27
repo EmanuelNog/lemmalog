@@ -183,6 +183,27 @@ store is new), via `OpenOptions::mode` on a `create_new` open, so `rename` keeps
 `write_atomic_keeps_the_store_mode`; end to end,
 `--test concurrency_lock_test cli_save_keeps_a_0600_store_private`.
 
+## 10. An absent `current` answer names its history
+
+**Upstream:** a closed fact has no `current` row, so a fully-ground goal answers `false` —
+"deliberately closed" and "never asserted" are the same answer. And `tombstone` rows are
+ordinary facts to retrieval's index (`internal_pred` hides `edge` but not `tombstone`), so
+`context` can spend budget on `tombstone(...)` lines that say nothing about the question.
+
+**Ours:** `Engine::history_hint` (delegated by `AgentMemory`) parses the goal; for a
+bound-subject/relation `current` atom with no live row it counts tombstones and closed
+edges for the fact — or for the slot when the object is a variable — reports the newest
+close, and names the follow-up query. Counts only: retired values stay out of the answer.
+The CLI prints it on stderr after `false`; MCP appends it to the answer.
+`retrieval::internal_pred` treats `tombstone` as bookkeeping, like `edge`.
+
+**Files:** `src/eval.rs` (`history_hint`), `src/agent.rs` (delegate), `src/retrieval.rs`
+(one predicate), `src/bin/lemmalog-cli.rs` (verdict and empty-answer branches),
+`src/bin/lemmalog-mcp.rs` (`lemmalog_query`).
+
+**Tests:** `tests/history_hint_test.rs`, `tests/retrieval_test.rs::tombstone_bookkeeping_is_not_retrieved_as_a_fact`,
+`tests/mcp_store_test.rs::a_closed_fact_explains_its_absence_on_both_surfaces`.
+
 ---
 
 ## Encoding a multi-valued fact that also needs revision

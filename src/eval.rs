@@ -2137,6 +2137,113 @@ impl<A: Annotation> Engine<A> {
         Ok(Some(holds))
     }
 
+    /// FORK ADDITION: when a `current(...)` query has no live value, say whether
+    /// the fact or slot has closed history, so `false` is not read as "never
+    /// known". Counts only: the closed VALUES stay out of the answer because
+    /// keeping a retired value out of the agent's context is the point of close.
+    ///
+    /// `None` when the goal is not a single `current` atom with a bound subject
+    /// and relation, or when a live row still answers it. A name the store never
+    /// interned cannot have history, so it answers the no-history line instead
+    /// of growing the symbol table (`interner.lookup`, never `sym`).
+    pub fn history_hint(&self, goal: &str) -> Option<String> {
+        let prog = crate::ast::parse_program(&format!("{goal}.")).ok()?;
+        if prog.len() != 1 || !prog[0].is_fact {
+            return None;
+        }
+        let head = &prog[0].head;
+        if head.pred != "current" || head.args.len() != 3 {
+            return None;
+        }
+        let name = |t: &Term| -> Option<String> {
+            match t {
+                Term::Sym(s) => Some(s.clone()),
+                Term::Int(i) => Some(i.to_string()),
+                _ => None,
+            }
+        };
+        let value = |t: &Term| -> Option<Value> {
+            match t {
+                Term::Sym(s) => self.interner.lookup(s).map(Value::Sym),
+                Term::Int(i) => Some(Value::Int(*i)),
+                _ => None,
+            }
+        };
+        let subject = name(&head.args[0])?;
+        let relation = name(&head.args[1])?;
+        let obj_bound = name(&head.args[2]);
+        let subj = value(&head.args[0]);
+        let rel = value(&head.args[1]);
+        let obj = if obj_bound.is_some() {
+            value(&head.args[2])
+        } else {
+            None
+        };
+
+        let no_history = |subject: &str, relation: &str, obj: &Option<String>| {
+            match obj {
+                Some(o) => format!(
+                    "hint: no current value and no recorded history for \"{subject}\" --{relation}--> \"{o}\"."
+                ),
+                None => format!(
+                    "hint: no current value and no recorded history in \"{subject}\" --{relation}-->."
+                ),
+            }
+        };
+        // An uninterned name cannot be in any row; do not query it, and do not
+        // intern it just to ask (`why` used to grow the symbol table that way).
+        let (Some(subj), Some(rel)) = (subj, rel) else {
+            return Some(no_history(&subject, &relation, &obj_bound));
+        };
+        if obj_bound.is_some() && obj.is_none() {
+            return Some(no_history(&subject, &relation, &obj_bound));
+        }
+        // A live row means this is not an absence; the caller prints the binding.
+        if !self
+            .query("current", &[Some(subj), Some(rel), obj])
+            .is_empty()
+        {
+            return None;
+        }
+        let tombs = self.query("tombstone", &[Some(subj), Some(rel), obj, None]);
+        let edges = self.query(
+            "edge",
+            &[Some(subj), Some(rel), obj, None, None, None],
+        );
+        let closed: Vec<i64> = edges
+            .iter()
+            .filter_map(|(k, _)| k[4].as_int())
+            .filter(|vt| *vt != i64::MAX)
+            .collect();
+        let newest = tombs
+            .iter()
+            .filter_map(|(k, _)| k[3].as_int())
+            .chain(closed.iter().copied())
+            .max();
+        if tombs.is_empty() && closed.is_empty() {
+            return Some(no_history(&subject, &relation, &obj_bound));
+        }
+        let (scope, example) = match &obj_bound {
+            Some(o) => (
+                format!("\"{subject}\" --{relation}--> \"{o}\""),
+                format!("tombstone(\"{subject}\", \"{relation}\", \"{o}\", T)"),
+            ),
+            None => (
+                format!("\"{subject}\" --{relation}--> any value"),
+                format!("tombstone(\"{subject}\", \"{relation}\", O, T)"),
+            ),
+        };
+        let when = newest
+            .map(|t| format!(" (newest close {t})"))
+            .unwrap_or_default();
+        Some(format!(
+            "hint: no current value for {scope}; {} tombstone(s), {} closed edge(s) in history{when}. \
+             Query {example} to list the closed values.",
+            tombs.len(),
+            closed.len()
+        ))
+    }
+
     /// Ask a conjunctive-free ground-or-varied atom, e.g.
     /// `current("alice", R, O)` or `reports_to(X, "carol")`, and get the
     /// variable bindings. Read-only, side-effect-free, terminating: the

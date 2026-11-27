@@ -189,6 +189,7 @@ fn internal_pred(p: &str) -> bool {
         || p == "describes"
         || p == "mentions"
         || p == "edge"
+        || p == "tombstone"
         || p.starts_with("cnt_")
         || p.starts_with("__agg:")
         || p.starts_with("__magic")

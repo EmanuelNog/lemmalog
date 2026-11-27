@@ -325,11 +325,22 @@ future-dated fact freezes its slot until real time catches up",
             // text carries the answer.
             match m.holds(&goal) {
                 Ok(Some(true)) => println!("true"),
-                Ok(Some(false)) => println!("false"),
+                Ok(Some(false)) => {
+                    println!("false");
+                    // FORK ADDITION: `false` alone cannot distinguish "never
+                    // asserted" from "closed"; name the history on stderr so
+                    // stdout stays a parseable verdict.
+                    if let Some(h) = m.history_hint(&goal) {
+                        eprintln!("{h}");
+                    }
+                }
                 Ok(None) => match m.ask(&goal) {
                     Ok(rows) => {
                         if rows.is_empty() {
                             println!("(no answers — asserted facts are current(S, rel, O))");
+                            if let Some(h) = m.history_hint(&goal) {
+                                eprintln!("{h}");
+                            }
                         } else {
                             println!("{}", rows.join("\n"));
                         }

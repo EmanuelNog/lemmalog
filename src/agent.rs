@@ -858,6 +858,12 @@ impl<X: Extractor> AgentMemory<X> {
         self.engine.holds(goal)
     }
 
+    /// FORK ADDITION: one line explaining an absent `current` answer — see
+    /// `Engine::history_hint`. `None` when there is nothing to explain.
+    pub fn history_hint(&self, goal: &str) -> Option<String> {
+        self.engine.history_hint(goal)
+    }
+
     /// Ingest PRE-PARSED facts (callers that extract themselves, e.g. the
     /// MCP server where the host model does extraction): applies the same
     /// update policy as `observe_at`, and returns the drop report for any

@@ -324,3 +324,64 @@ fn a_healthy_store_still_serves() {
     let _ = std::fs::remove_file(&store);
     let _ = seed;
 }
+
+#[test]
+fn a_closed_fact_explains_its_absence_on_both_surfaces() {
+    // The CLI and MCP must both answer `false` AND say that the value has
+    // history — a bare `false` reads as "never known", which is a different
+    // claim and sends the agent away from the tombstone.
+    let dir = std::env::temp_dir();
+    let store = dir.join(format!("lemmalog-mcp-history-{}.snap", std::process::id()));
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_lemmalog-cli"))
+        .args(["observe", "--facts"])
+        .env("LEMMALOG_MCP_PATH", &store)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("cli must spawn");
+    cli.stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(b"svc --version--> 2.0.0\n")
+        .expect("write");
+    assert!(cli.wait_with_output().expect("wait").status.success());
+
+    let close = Command::new(env!("CARGO_BIN_EXE_lemmalog-cli"))
+        .args(["close", "--facts", "svc --version--> 2.0.0"])
+        .env("LEMMALOG_MCP_PATH", &store)
+        .output()
+        .expect("cli close");
+    assert!(close.status.success(), "{close:?}");
+
+    let q = Command::new(env!("CARGO_BIN_EXE_lemmalog-cli"))
+        .args([
+            "query",
+            "--goal",
+            r#"current("svc", version, "2.0.0")"#,
+        ])
+        .env("LEMMALOG_MCP_PATH", &store)
+        .output()
+        .expect("cli query");
+    let stdout = String::from_utf8_lossy(&q.stdout);
+    let stderr = String::from_utf8_lossy(&q.stderr);
+    assert!(stdout.contains("false"), "stdout: {stdout}");
+    assert!(
+        stderr.contains("1 tombstone"),
+        "the CLI must explain the absence: {stderr}"
+    );
+
+    let goal = r#"current("svc", version, "2.0.0")"#;
+    let ask = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"lemmalog_query","arguments":{{"goal":{}}}}}}}"#,
+        serde_json::to_string(goal).expect("goal json")
+    );
+    let out = run_server(&store, &[INIT, &ask]);
+    let mcp = String::from_utf8_lossy(&out.stdout);
+    assert!(mcp.contains("false"), "{mcp}");
+    assert!(
+        mcp.contains("1 tombstone"),
+        "the MCP query must carry the same hint: {mcp}"
+    );
+    let _ = std::fs::remove_file(&store);
+}

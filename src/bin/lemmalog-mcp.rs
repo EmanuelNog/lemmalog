@@ -694,14 +694,31 @@ fn tool_call_inner(state: &mut State, name: &str, args: &J, path: Option<&str>) 
                 }
             }
             match engine_of(state).holds(&goal) {
-                Ok(Some(t)) => Ok(format!("{}{hint}", if t { "true" } else { "false" })),
+                Ok(Some(t)) => {
+                    let history = if t {
+                        String::new()
+                    } else {
+                        engine_of(state)
+                            .history_hint(&goal)
+                            .map(|h| format!("\n{h}"))
+                            .unwrap_or_default()
+                    };
+                    Ok(format!("{}{hint}{history}", if t { "true" } else { "false" }))
+                }
                 // variables: bindings, as before (parse errors surface here too)
                 _ => match engine_of(state).ask(&goal) {
-                    Ok(rows) => Ok(format!("{}{hint}", if rows.is_empty() {
-                        empty_query_hint(engine_of(state), &goal)
-                    } else {
-                        rows.join("\n")
-                    })),
+                    Ok(rows) => {
+                        if rows.is_empty() {
+                            let mut body = empty_query_hint(engine_of(state), &goal);
+                            if let Some(h) = engine_of(state).history_hint(&goal) {
+                                body.push('\n');
+                                body.push_str(&h);
+                            }
+                            Ok(format!("{body}{hint}"))
+                        } else {
+                            Ok(format!("{}{hint}", rows.join("\n")))
+                        }
+                    }
                     Err(e) => Err(format!(
                         "parse: could not parse goal `{}`\nreason: {e}\nhint: quote entity names — bare capitalized words are variables. Example: reports_to(\"Alice\", Y)",
                         truncate(&goal, 120)
